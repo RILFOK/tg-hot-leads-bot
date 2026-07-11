@@ -5,11 +5,16 @@
   "type": "module",
   "scripts": {
     "dev": "tsx src/index.ts",
-    "start": "tsx src/index.ts",
+    "build": "rm -rf dist && esbuild src/index.ts --bundle --platform=node --format=esm --target=node22 --packages=external --sourcemap --outfile=dist/index.js",
+    "start": "node --enable-source-maps dist/index.js",
     "typecheck": "tsc --noEmit",
+    "check": "npm run db:generate && npm run typecheck && npm run build && node --check dist/index.js && npm audit --omit=dev --audit-level=moderate",
     "db:push": "prisma db push",
     "db:generate": "prisma generate",
-    "db:studio": "prisma studio"
+    "db:studio": "prisma studio",
+    "backup": "bash scripts/backup-db.sh",
+    "health": "bash scripts/healthcheck.sh",
+    "deploy": "bash scripts/deploy.sh"
   },
   "dependencies": {
     "@prisma/adapter-pg": "^7.8.0",
@@ -22,8 +27,15 @@
   "devDependencies": {
     "@types/node": "^22.10.5",
     "@types/pg": "^8.20.0",
+    "esbuild": "^0.28.1",
     "prisma": "^7.8.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=22 <23"
+  },
+  "overrides": {
+    "@hono/node-server": "1.19.13"
   }
 }
