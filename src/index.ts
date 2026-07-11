@@ -910,6 +910,19 @@ function buildUserMainKeyboard(): InlineKeyboard {
     .text("➕ Добавить триггер", "triggers:add");
 }
 
+function buildInactiveSubscriptionKeyboard(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text(
+      "💳 Моя подписка",
+      "subscription:view"
+    )
+    .row()
+    .text(
+      "📋 Тарифы",
+      "plans:view"
+    );
+}
+
 function getTriggerButtonLabel(
   trigger: UserTriggerData
 ): string {
@@ -2772,15 +2785,69 @@ bot.command("start", async (ctx) => {
       return;
     }
 
+    const plan = getPlanDefinition({
+      role: user.role,
+      subscription
+    });
+
+    const statusLabel =
+      getEffectiveSubscriptionStatusLabel(
+        subscription.status,
+        subscription.expiresAt
+      );
+
+    const hasAccess =
+      hasSubscriptionAccess({
+        ...user,
+        subscription
+      });
+
+    if (!hasAccess) {
+      await ctx.reply(
+        [
+          "👋 <b>Аккаунт активен</b>",
+          "",
+          `Тариф: ${escapeHtml(plan.label)}`,
+          `Статус подписки: ${escapeHtml(statusLabel)}`,
+          "Доступ: ⛔ приостановлен",
+          `Доступ до: ${escapeHtml(
+            formatAccessDate(
+              subscription.expiresAt
+            )
+          )}`,
+          "",
+          "Ваши данные, источники, триггеры и история лидов сохранены.",
+          "",
+          "Для восстановления доступа выберите тариф или обратитесь к владельцу бота.",
+          "",
+          "Доступные команды:",
+          "/profile — профиль и использование",
+          "/subscription — состояние подписки",
+          "/plans — доступные тарифы",
+          "/id — показать ваш Telegram ID"
+        ].join("\n"),
+        {
+          parse_mode: "HTML",
+          reply_markup:
+            buildInactiveSubscriptionKeyboard()
+        }
+      );
+      return;
+    }
+
     await ctx.reply(
       [
-        "👋 Добро пожаловать!",
+        "👋 <b>Добро пожаловать!</b>",
         "",
-        "Ваш аккаунт зарегистрирован.",
+        "Ваш аккаунт активен.",
         "",
-        `Тариф: ${subscription.planCode}`,
-        `Статус: ${subscription.status}`,
-        `Доступ до: ${formatAccessDate(subscription.expiresAt)}`,
+        `Тариф: ${escapeHtml(plan.label)}`,
+        `Статус подписки: ${escapeHtml(statusLabel)}`,
+        `Доступ до: ${escapeHtml(
+          formatAccessDate(
+            subscription.expiresAt
+          )
+        )}`,
         "",
         "Доступные команды:",
         "/profile — профиль и использование",
@@ -2803,6 +2870,7 @@ bot.command("start", async (ctx) => {
         "/id — показать ваш Telegram ID"
       ].join("\n"),
       {
+        parse_mode: "HTML",
         reply_markup: buildUserMainKeyboard()
       }
     );
@@ -3507,7 +3575,9 @@ bot.command("subscription", async (ctx) => {
   );
 });
 
-bot.command("plans", async (ctx) => {
+async function replyWithPlans(
+  ctx: Context
+): Promise<void> {
   const trial = PLAN_DEFINITIONS.TRIAL;
   const start = PLAN_DEFINITIONS.START;
   const pro = PLAN_DEFINITIONS.PRO;
@@ -3541,6 +3611,10 @@ bot.command("plans", async (ctx) => {
       parse_mode: "HTML"
     }
   );
+}
+
+bot.command("plans", async (ctx) => {
+  await replyWithPlans(ctx);
 });
 
 function parseSubscriptionDays(
@@ -5209,6 +5283,26 @@ bot.command("unblockchat", async (ctx) => {
 
   await ctx.reply(`✅ Источник разблокирован: ${chatId}`);
 });
+
+bot.callbackQuery(
+  "subscription:view",
+  async (ctx) => {
+    await ctx.answerCallbackQuery();
+
+    await replyWithSubscriptionProfile(
+      ctx,
+      "💳 <b>Моя подписка</b>"
+    );
+  }
+);
+
+bot.callbackQuery(
+  "plans:view",
+  async (ctx) => {
+    await ctx.answerCallbackQuery();
+    await replyWithPlans(ctx);
+  }
+);
 
 async function getTriggerCallbackUser(
   ctx: Context
