@@ -1,0 +1,234 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum LeadStatus {
+  NEW
+  CONTACTED
+  WAITING_REPLY
+  IN_PROGRESS
+  WON
+  LOST
+  IGNORED
+  DELETED
+}
+
+enum LeadCategory {
+  SITE
+  LANDING
+  SHOP
+  SUPPORT
+  UNKNOWN
+}
+
+enum UserRole {
+  OWNER
+  USER
+}
+
+enum SubscriptionStatus {
+  TRIAL
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  EXPIRED
+}
+
+enum LeadDeliveryType {
+  OWNER_GLOBAL
+  USER_TRIGGER
+}
+
+model Lead {
+  id String @id @default(cuid())
+
+  // Изолирует глобальные лиды владельца от персональных лидов.
+  // Новые значения: OWNER или USER:<BotUser.id>.
+  // LEGACY используется для существующих записей.
+  scopeKey String @default("LEGACY")
+
+  sourceChatId     String
+  sourceChatTitle  String
+  sourceMessageId  Int
+  messageText      String
+  matchedKeywords  String[]
+  negativeKeywords String[]
+  score            Int
+  category         LeadCategory @default(UNKNOWN)
+
+  authorTelegramId String?
+  authorUsername   String?
+  authorName       String?
+
+  messageUrl String?
+  note       String?
+
+  adminChatId    String?
+  adminMessageId Int?
+
+  triggerCount    Int      @default(1)
+  lastTriggeredAt DateTime @default(now())
+
+  status LeadStatus @default(NEW)
+
+  deliveries LeadDelivery[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([sourceChatId, sourceMessageId, scopeKey])
+  @@index([scopeKey, authorTelegramId, status, lastTriggeredAt])
+  @@index([status])
+  @@index([category])
+  @@index([createdAt])
+  @@index([authorTelegramId])
+  @@index([lastTriggeredAt])
+  @@index([adminChatId, adminMessageId])
+}
+
+model BannedUser {
+  id         String  @id @default(cuid())
+  telegramId String  @unique
+  username   String?
+  name       String?
+  reason     String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model BlackWord {
+  id        String   @id @default(cuid())
+  phrase    String   @unique
+  createdAt DateTime @default(now())
+}
+
+model SourceChat {
+  chatId    String  @id
+  title     String
+  isBlocked Boolean @default(false)
+
+  users UserSourceChat[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model BotUser {
+  id         String  @id @default(cuid())
+  telegramId String  @unique
+  username   String?
+  firstName  String?
+  lastName   String?
+
+  role     UserRole @default(USER)
+  isActive Boolean  @default(true)
+
+  // Чат, в который пользователь получает свои уведомления.
+  deliveryChatId String?
+
+  subscription Subscription?
+  triggers     UserTrigger[]
+  sourceChats  UserSourceChat[]
+  deliveries   LeadDelivery[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([role])
+  @@index([isActive])
+}
+
+model Subscription {
+  id     String @id @default(cuid())
+  userId String @unique
+
+  planCode String             @default("TRIAL")
+  status   SubscriptionStatus @default(TRIAL)
+
+  startsAt  DateTime  @default(now())
+  expiresAt DateTime?
+  autoRenew Boolean   @default(false)
+
+  user BotUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([expiresAt])
+}
+
+model UserTrigger {
+  id     String @id @default(cuid())
+  userId String
+
+  phrase           String
+  normalizedPhrase String
+  isActive         Boolean @default(true)
+
+  user BotUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, normalizedPhrase])
+  @@index([userId, isActive])
+}
+
+model UserSourceChat {
+  id     String @id @default(cuid())
+  userId String
+  chatId String
+
+  // Отключение источника влияет только на персональные уведомления.
+  // Глобальный детектор сайтов владельца продолжает работать.
+  isActive Boolean @default(true)
+
+  user       BotUser    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sourceChat SourceChat @relation(fields: [chatId], references: [chatId], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, chatId])
+  @@index([chatId, isActive])
+}
+
+model LeadDelivery {
+  id     String @id @default(cuid())
+  leadId String
+
+  recipientUserId String?
+  recipientChatId String
+
+  deliveryType LeadDeliveryType
+
+  // Пользовательские триггеры, вызвавшие доставку.
+  // Для OWNER_GLOBAL массив остаётся пустым.
+  matchedTriggers String[]
+
+  telegramMessageId Int?
+
+  // Личный статус и заметка конкретного получателя.
+  // Не изменяют глобальный Lead.status владельца.
+  status LeadStatus @default(NEW)
+  note   String?
+
+  lead          Lead     @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  recipientUser BotUser? @relation(fields: [recipientUserId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Один лид не отправляется дважды в один чат.
+  @@unique([leadId, recipientChatId])
+  @@index([recipientUserId, createdAt])
+  @@index([recipientUserId, status, updatedAt])
+  @@index([deliveryType])
+}

@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Build output
+dist/
+generated/
+coverage/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Local backups
+*.backup
+*.backup-*
+*.backup-*.*
+**/*.backup-*
+
+# IDE and OS
+.DS_Store
+.idea/
+.vscode/
