@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { randomUUID } from "node:crypto";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { Bot, InlineKeyboard } from "grammy";
 import type { Context } from "grammy";
@@ -7,6 +8,8 @@ import {
   LeadCategory,
   LeadDeliveryType,
   LeadStatus,
+  PaymentProvider,
+  PaymentStatus,
   PrismaClient,
   SubscriptionStatus,
   UserRole
@@ -20,11 +23,100 @@ const databaseUrl = process.env.DATABASE_URL?.trim();
 const telegramProxyUrl =
   process.env.TELEGRAM_PROXY_URL?.trim();
 
+function readOptionalPositiveIntegerEnv(
+  name: string
+): number | null {
+  const rawValue =
+    process.env[name]?.trim();
+
+  if (!rawValue) {
+    return null;
+  }
+
+  if (!/^\d+$/.test(rawValue)) {
+    throw new Error(
+      `${name} должен быть положительным целым числом`
+    );
+  }
+
+  const value = Number(rawValue);
+
+  if (
+    !Number.isSafeInteger(value) ||
+    value <= 0
+  ) {
+    throw new Error(
+      `${name} должен быть положительным целым числом`
+    );
+  }
+
+  return value;
+}
+
+function rublesToMinorUnits(
+  envName: string,
+  rubles: number | null
+): number | null {
+  if (rubles === null) {
+    return null;
+  }
+
+  const amountMinor =
+    rubles * 100;
+
+  if (!Number.isSafeInteger(amountMinor)) {
+    throw new Error(
+      `${envName} содержит слишком большое значение`
+    );
+  }
+
+  return amountMinor;
+}
+
 const minLeadScore = Number(process.env.MIN_LEAD_SCORE ?? 3);
 const hotLeadMinutes = Number(process.env.HOT_LEAD_MINUTES ?? 30);
 const spamWindowMinutes = Number(process.env.SPAM_WINDOW_MINUTES ?? 15);
 const spamMaxTriggers = Number(process.env.SPAM_MAX_TRIGGERS ?? 10);
 const trialDays = Number(process.env.TRIAL_DAYS ?? 7);
+
+const paymentDurationDays =
+  readOptionalPositiveIntegerEnv(
+    "PAYMENT_DURATION_DAYS"
+  ) ?? 30;
+
+const paymentOrderTtlMinutes =
+  readOptionalPositiveIntegerEnv(
+    "PAYMENT_ORDER_TTL_MINUTES"
+  ) ?? 30;
+
+const paymentOrderTtlMs =
+  paymentOrderTtlMinutes * 60 * 1000;
+
+const startPriceStars =
+  readOptionalPositiveIntegerEnv(
+    "START_PRICE_STARS"
+  );
+
+const proPriceStars =
+  readOptionalPositiveIntegerEnv(
+    "PRO_PRICE_STARS"
+  );
+
+const startPriceRubMinor =
+  rublesToMinorUnits(
+    "START_PRICE_RUB",
+    readOptionalPositiveIntegerEnv(
+      "START_PRICE_RUB"
+    )
+  );
+
+const proPriceRubMinor =
+  rublesToMinorUnits(
+    "PRO_PRICE_RUB",
+    readOptionalPositiveIntegerEnv(
+      "PRO_PRICE_RUB"
+    )
+  );
 
 const hotLeadMs = hotLeadMinutes * 60 * 1000;
 const spamWindowMs = spamWindowMinutes * 60 * 1000;
@@ -60,6 +152,26 @@ if (!Number.isInteger(spamMaxTriggers) || spamMaxTriggers <= 0) {
 
 if (!Number.isInteger(trialDays) || trialDays <= 0) {
   throw new Error("TRIAL_DAYS должен быть положительным целым числом");
+}
+
+if (
+  !Number.isInteger(paymentDurationDays) ||
+  paymentDurationDays <= 0 ||
+  paymentDurationDays > 3650
+) {
+  throw new Error(
+    "PAYMENT_DURATION_DAYS должен быть целым числом от 1 до 3650"
+  );
+}
+
+if (
+  !Number.isInteger(paymentOrderTtlMinutes) ||
+  paymentOrderTtlMinutes < 5 ||
+  paymentOrderTtlMinutes > 1440
+) {
+  throw new Error(
+    "PAYMENT_ORDER_TTL_MINUTES должен быть целым числом от 5 до 1440"
+  );
 }
 
 type PlanCode =
@@ -109,6 +221,31 @@ const PLAN_DEFINITIONS: Record<
     label: "Ручная подписка",
     maxTriggers: 20,
     maxSources: 5
+  }
+};
+
+type PaymentOffer = {
+  planCode: PaidPlanCode;
+  durationDays: number;
+  starsAmount: number | null;
+  rubAmountMinor: number | null;
+};
+
+const PAYMENT_OFFERS: Record<
+  PaidPlanCode,
+  PaymentOffer
+> = {
+  START: {
+    planCode: "START",
+    durationDays: paymentDurationDays,
+    starsAmount: startPriceStars,
+    rubAmountMinor: startPriceRubMinor
+  },
+  PRO: {
+    planCode: "PRO",
+    durationDays: paymentDurationDays,
+    starsAmount: proPriceStars,
+    rubAmountMinor: proPriceRubMinor
   }
 };
 
@@ -169,6 +306,103 @@ function formatPlanUsage(
   return limit === null
     ? `${current} / без ограничений`
     : `${current} / ${limit}`;
+}
+
+function formatRubPrice(
+  amountMinor: number | null
+): string {
+  if (amountMinor === null) {
+    return "не настроена";
+  }
+
+  return `${new Intl.NumberFormat(
+    "ru-RU",
+    {
+      maximumFractionDigits: 2
+    }
+  ).format(amountMinor / 100)} ₽`;
+}
+
+function formatStarsPrice(
+  amount: number | null
+): string {
+  if (amount === null) {
+    return "не настроена";
+  }
+
+  return `${new Intl.NumberFormat(
+    "ru-RU"
+  ).format(amount)} Stars`;
+}
+
+function formatPaymentOfferPrices(
+  offer: PaymentOffer
+): string {
+  const prices: string[] = [];
+
+  if (offer.starsAmount !== null) {
+    prices.push(
+      formatStarsPrice(
+        offer.starsAmount
+      )
+    );
+  }
+
+  if (offer.rubAmountMinor !== null) {
+    prices.push(
+      formatRubPrice(
+        offer.rubAmountMinor
+      )
+    );
+  }
+
+  return prices.length > 0
+    ? prices.join(" / ")
+    : "цена не настроена";
+}
+
+function getPaymentProviderLabel(
+  provider: PaymentProvider
+): string {
+  switch (provider) {
+    case PaymentProvider.TELEGRAM_STARS:
+      return "Telegram Stars";
+    case PaymentProvider.YOOKASSA:
+      return "ЮKassa";
+    case PaymentProvider.ROBOKASSA:
+      return "Robokassa";
+  }
+}
+
+function getConfiguredPaymentAmount(
+  provider: PaymentProvider,
+  offer: PaymentOffer
+): {
+  amountMinor: number;
+  currency: "XTR" | "RUB";
+} | null {
+  if (
+    provider ===
+    PaymentProvider.TELEGRAM_STARS
+  ) {
+    if (offer.starsAmount === null) {
+      return null;
+    }
+
+    return {
+      amountMinor: offer.starsAmount,
+      currency: "XTR"
+    };
+  }
+
+  if (offer.rubAmountMinor === null) {
+    return null;
+  }
+
+  return {
+    amountMinor: offer.rubAmountMinor,
+    currency: "RUB"
+  };
 }
 
 const adapter = new PrismaPg({
@@ -919,6 +1153,44 @@ function buildInactiveSubscriptionKeyboard(): InlineKeyboard {
     .row()
     .text(
       "📋 Тарифы",
+      "plans:view"
+    );
+}
+
+function buildPlansKeyboard(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text(
+      "🚀 Выбрать Start",
+      "payment:plan:START"
+    )
+    .row()
+    .text(
+      "💼 Выбрать Pro",
+      "payment:plan:PRO"
+    );
+}
+
+function buildPaymentProviderKeyboard(
+  planCode: PaidPlanCode
+): InlineKeyboard {
+  return new InlineKeyboard()
+    .text(
+      "⭐ Telegram Stars",
+      `payment:provider:TELEGRAM_STARS:${planCode}`
+    )
+    .row()
+    .text(
+      "💳 ЮKassa",
+      `payment:provider:YOOKASSA:${planCode}`
+    )
+    .row()
+    .text(
+      "💳 Robokassa",
+      `payment:provider:ROBOKASSA:${planCode}`
+    )
+    .row()
+    .text(
+      "← Назад к тарифам",
       "plans:view"
     );
 }
@@ -2824,6 +3096,8 @@ bot.command("start", async (ctx) => {
           "/profile — профиль и использование",
           "/subscription — состояние подписки",
           "/plans — доступные тарифы",
+          "/paysupport — поддержка по оплате",
+          "/terms — условия использования и оплаты",
           "/id — показать ваш Telegram ID"
         ].join("\n"),
         {
@@ -2853,6 +3127,8 @@ bot.command("start", async (ctx) => {
         "/profile — профиль и использование",
         "/subscription — состояние подписки",
         "/plans — доступные тарифы",
+        "/paysupport — поддержка по оплате",
+        "/terms — условия использования и оплаты",
         "/triggers — мои триггеры",
         "/addtrigger фраза — добавить триггер",
         "/removetrigger фраза — удалить триггер",
@@ -2890,6 +3166,8 @@ bot.command("start", async (ctx) => {
       "/profile — профиль и использование",
       "/subscription — состояние подписки",
       "/plans — доступные тарифы",
+      "/paysupport — поддержка по оплате",
+      "/terms — условия использования и оплаты",
       "/triggers — персональные триггеры",
       "/addtrigger фраза — добавить триггер",
       "/removetrigger фраза — удалить триггер",
@@ -3575,12 +3853,69 @@ bot.command("subscription", async (ctx) => {
   );
 });
 
+async function replyWithPaymentMethods(
+  ctx: Context,
+  planCode: PaidPlanCode
+): Promise<void> {
+  const plan =
+    PLAN_DEFINITIONS[planCode];
+
+  const offer =
+    PAYMENT_OFFERS[planCode];
+
+  await ctx.reply(
+    [
+      `💳 <b>Оплата тарифа ${escapeHtml(plan.label)}</b>`,
+      "",
+      `Срок: ${offer.durationDays} дн.`,
+      `Триггеры: ${formatPlanLimit(plan.maxTriggers)}`,
+      `Источники: ${formatPlanLimit(plan.maxSources)}`,
+      "",
+      "Выберите способ оплаты:",
+      "",
+      `⭐ Telegram Stars: ${escapeHtml(
+        formatStarsPrice(
+          offer.starsAmount
+        )
+      )}`,
+      `💳 ЮKassa: ${escapeHtml(
+        formatRubPrice(
+          offer.rubAmountMinor
+        )
+      )}`,
+      `💳 Robokassa: ${escapeHtml(
+        formatRubPrice(
+          offer.rubAmountMinor
+        )
+      )}`,
+      "",
+      `Счёт действителен: ${paymentOrderTtlMinutes} мин.`,
+      "Подписка будет активирована только после подтверждения платежа.",
+      "",
+      "Оплачивая тариф, вы принимаете условия: /terms"
+    ].join("\n"),
+    {
+      parse_mode: "HTML",
+      reply_markup:
+        buildPaymentProviderKeyboard(
+          planCode
+        )
+    }
+  );
+}
+
 async function replyWithPlans(
   ctx: Context
 ): Promise<void> {
   const trial = PLAN_DEFINITIONS.TRIAL;
   const start = PLAN_DEFINITIONS.START;
   const pro = PLAN_DEFINITIONS.PRO;
+
+  const startOffer =
+    PAYMENT_OFFERS.START;
+
+  const proOffer =
+    PAYMENT_OFFERS.PRO;
 
   await ctx.reply(
     [
@@ -3592,10 +3927,22 @@ async function replyWithPlans(
       `Источники: ${formatPlanLimit(trial.maxSources)}`,
       "",
       `🚀 <b>${escapeHtml(start.label)}</b>`,
+      `Срок: ${startOffer.durationDays} дней`,
+      `Цена: ${escapeHtml(
+        formatPaymentOfferPrices(
+          startOffer
+        )
+      )}`,
       `Триггеры: ${formatPlanLimit(start.maxTriggers)}`,
       `Источники: ${formatPlanLimit(start.maxSources)}`,
       "",
       `💼 <b>${escapeHtml(pro.label)}</b>`,
+      `Срок: ${proOffer.durationDays} дней`,
+      `Цена: ${escapeHtml(
+        formatPaymentOfferPrices(
+          proOffer
+        )
+      )}`,
       `Триггеры: ${formatPlanLimit(pro.maxTriggers)}`,
       `Источники: ${formatPlanLimit(pro.maxSources)}`,
       "",
@@ -3605,16 +3952,88 @@ async function replyWithPlans(
       "• статусы и работа с лидами;",
       "• архив, корзина и заметки;",
       "",
-      "Стоимость и подключение тарифа — через владельца бота."
+      "Выберите тариф для продолжения."
     ].join("\n"),
     {
-      parse_mode: "HTML"
+      parse_mode: "HTML",
+      reply_markup:
+        buildPlansKeyboard()
     }
   );
 }
 
 bot.command("plans", async (ctx) => {
   await replyWithPlans(ctx);
+});
+
+bot.command("paysupport", async (ctx) => {
+  const telegramId =
+    ctx.from?.id
+      ? String(ctx.from.id)
+      : "не определён";
+
+  await ctx.reply(
+    [
+      "🛟 <b>Поддержка по оплате</b>",
+      "",
+      "По вопросам оплаты и активации подписки напишите владельцу:",
+      "@rilfok",
+      "",
+      `Ваш Telegram ID: <code>${escapeHtml(
+        telegramId
+      )}</code>`,
+      "",
+      "При обращении укажите:",
+      "• Telegram ID;",
+      "• выбранный тариф;",
+      "• способ оплаты;",
+      "• ID заказа из сообщения бота;",
+      "",
+      "Поддержка Telegram не обрабатывает споры по покупкам, совершённым внутри этого бота."
+    ].join("\n"),
+    {
+      parse_mode: "HTML"
+    }
+  );
+});
+
+bot.command("terms", async (ctx) => {
+  await ctx.reply(
+    [
+      "📄 <b>Условия использования и оплаты</b>",
+      "",
+      "1. Предмет услуги",
+      "Оплата предоставляет доступ к функциям Telegram-бота мониторинга заявок и персональных триггеров.",
+      "",
+      "2. Тариф и срок",
+      `Платный доступ предоставляется на ${paymentDurationDays} дней. Лимиты тарифов указаны в разделе /plans.`,
+      "",
+      "3. Активация",
+      "Подписка активируется только после подтверждения успешной оплаты платёжным провайдером.",
+      "",
+      "4. Работа сервиса",
+      "Бот автоматизирует поиск и обработку сообщений, но не гарантирует количество заявок, их качество или заключение сделок.",
+      "",
+      "5. Ответственность пользователя",
+      "Пользователь самостоятельно отвечает за законность подключения источников, обработку информации и общение с потенциальными клиентами.",
+      "",
+      "6. Ошибки оплаты и возвраты",
+      "При ошибке оплаты или активации обратитесь через /paysupport. Обращение рассматривается с учётом фактического предоставления доступа и правил выбранного платёжного провайдера.",
+      "",
+      "7. Данные",
+      "Бот хранит Telegram ID, настройки, историю заявок и технические идентификаторы платежей. Банковские реквизиты бот не сохраняет.",
+      "",
+      "8. Изменение условий",
+      "Изменения цен и условий применяются к новым покупкам. Уже оплаченный период сохраняется до даты окончания.",
+      "",
+      "Поддержка: @rilfok",
+      "",
+      "Оплата означает принятие этих условий."
+    ].join("\n"),
+    {
+      parse_mode: "HTML"
+    }
+  );
 });
 
 function parseSubscriptionDays(
@@ -3655,6 +4074,375 @@ function parsePaidPlanCode(
   }
 
   return null;
+}
+
+async function createPaymentRecord(
+  userId: string,
+  provider: PaymentProvider,
+  planCode: PaidPlanCode
+) {
+  const offer =
+    PAYMENT_OFFERS[planCode];
+
+  const configuredAmount =
+    getConfiguredPaymentAmount(
+      provider,
+      offer
+    );
+
+  if (!configuredAmount) {
+    return null;
+  }
+
+  return prisma.payment.create({
+    data: {
+      userId,
+      provider,
+      status: PaymentStatus.CREATED,
+      planCode,
+      durationDays:
+        offer.durationDays,
+      amountMinor:
+        configuredAmount.amountMinor,
+      currency:
+        configuredAmount.currency,
+      idempotencyKey:
+        randomUUID(),
+      expiresAt: new Date(
+        Date.now() +
+        paymentOrderTtlMs
+      ),
+      metadata: {
+        source: "telegram_bot"
+      }
+    }
+  });
+}
+
+function buildTelegramStarsInvoicePayload(
+  paymentId: string
+): string {
+  return `payment:${paymentId}`;
+}
+
+function parseTelegramStarsInvoicePayload(
+  payload: string
+): string | null {
+  const prefix = "payment:";
+
+  if (!payload.startsWith(prefix)) {
+    return null;
+  }
+
+  const paymentId =
+    payload.slice(prefix.length).trim();
+
+  return paymentId || null;
+}
+
+async function sendTelegramStarsInvoice(
+  ctx: Context,
+  payment: {
+    id: string;
+    amountMinor: number;
+    durationDays: number;
+  },
+  planCode: PaidPlanCode
+): Promise<void> {
+  if (
+    !ctx.chat ||
+    ctx.chat.type !== "private"
+  ) {
+    throw new Error(
+      "Оплата Telegram Stars доступна только в личном чате"
+    );
+  }
+
+  const plan =
+    PLAN_DEFINITIONS[planCode];
+
+  await ctx.replyWithInvoice(
+    `${plan.label} — ${payment.durationDays} дней`,
+    [
+      `${payment.durationDays} дней доступа к боту.`,
+      `До ${formatPlanLimit(
+        plan.maxTriggers
+      )} триггеров и до ${formatPlanLimit(
+        plan.maxSources
+      )} источников.`
+    ].join(" "),
+    buildTelegramStarsInvoicePayload(
+      payment.id
+    ),
+    "XTR",
+    [
+      {
+        label: `Тариф ${plan.label}`,
+        amount: payment.amountMinor
+      }
+    ],
+    {
+      provider_token: "",
+      start_parameter:
+        `payment_${payment.id}`,
+      protect_content: true
+    }
+  );
+
+  await prisma.payment.updateMany({
+    where: {
+      id: payment.id,
+      status: PaymentStatus.CREATED,
+      activatedAt: null
+    },
+    data: {
+      status: PaymentStatus.PENDING
+    }
+  });
+}
+
+type PaymentActivationResult = {
+  paymentId: string;
+  userId: string;
+  deliveryChatId: string | null;
+  planCode: PaidPlanCode;
+  expiresAt: Date;
+  alreadyActivated: boolean;
+};
+
+async function activateSubscriptionFromPayment(
+  paymentId: string,
+  providerPaymentId: string
+): Promise<PaymentActivationResult> {
+  const result =
+    await prisma.$transaction(
+      async (tx) => {
+        const payment =
+          await tx.payment.findUnique({
+            where: {
+              id: paymentId
+            },
+            include: {
+              user: {
+                select: {
+                  id: true,
+                  telegramId: true,
+                  deliveryChatId: true,
+                  role: true,
+                  subscription: {
+                    select: {
+                      expiresAt: true
+                    }
+                  }
+                }
+              }
+            }
+          });
+
+        if (!payment) {
+          throw new Error(
+            `Платёж не найден: ${paymentId}`
+          );
+        }
+
+        if (
+          payment.user.role ===
+          UserRole.OWNER
+        ) {
+          throw new Error(
+            "Владельцу не требуется платная подписка"
+          );
+        }
+
+        const planCode =
+          parsePaidPlanCode(
+            payment.planCode
+          );
+
+        if (!planCode) {
+          throw new Error(
+            `Некорректный тариф платежа: ${payment.planCode}`
+          );
+        }
+
+        if (payment.activatedAt) {
+          const currentExpiresAt =
+            payment.user.subscription
+              ?.expiresAt;
+
+          if (!currentExpiresAt) {
+            throw new Error(
+              "Платёж отмечен активированным, но срок подписки отсутствует"
+            );
+          }
+
+          return {
+            paymentId: payment.id,
+            userId: payment.user.id,
+            deliveryChatId:
+              payment.user.deliveryChatId,
+            planCode,
+            expiresAt:
+              currentExpiresAt,
+            alreadyActivated: true
+          };
+        }
+
+        const now = new Date();
+
+        const claim =
+          await tx.payment.updateMany({
+            where: {
+              id: payment.id,
+              activatedAt: null,
+              status: {
+                in: [
+                  PaymentStatus.CREATED,
+                  PaymentStatus.PENDING,
+                  PaymentStatus.SUCCEEDED
+                ]
+              }
+            },
+            data: {
+              status:
+                PaymentStatus.SUCCEEDED,
+              providerPaymentId,
+              paidAt:
+                payment.paidAt ?? now,
+              activatedAt: now,
+              failureReason: null
+            }
+          });
+
+        if (claim.count === 0) {
+          const currentPayment =
+            await tx.payment.findUnique({
+              where: {
+                id: payment.id
+              },
+              include: {
+                user: {
+                  select: {
+                    id: true,
+                    deliveryChatId: true,
+                    subscription: {
+                      select: {
+                        expiresAt: true
+                      }
+                    }
+                  }
+                }
+              }
+            });
+
+          const currentExpiresAt =
+            currentPayment?.user
+              .subscription?.expiresAt;
+
+          if (
+            !currentPayment?.activatedAt ||
+            !currentExpiresAt
+          ) {
+            throw new Error(
+              "Платёж не может быть активирован в текущем статусе"
+            );
+          }
+
+          return {
+            paymentId:
+              currentPayment.id,
+            userId:
+              currentPayment.user.id,
+            deliveryChatId:
+              currentPayment.user
+                .deliveryChatId,
+            planCode,
+            expiresAt:
+              currentExpiresAt,
+            alreadyActivated: true
+          };
+        }
+
+        const currentExpiresAt =
+          payment.user.subscription
+            ?.expiresAt;
+
+        const extensionBase =
+          currentExpiresAt &&
+          currentExpiresAt.getTime() >
+            now.getTime()
+            ? currentExpiresAt
+            : now;
+
+        const expiresAt =
+          addDaysToDate(
+            extensionBase,
+            payment.durationDays
+          );
+
+        await tx.subscription.upsert({
+          where: {
+            userId: payment.user.id
+          },
+          update: {
+            planCode,
+            status:
+              SubscriptionStatus.ACTIVE,
+            startsAt: now,
+            expiresAt,
+            autoRenew: false
+          },
+          create: {
+            userId: payment.user.id,
+            planCode,
+            status:
+              SubscriptionStatus.ACTIVE,
+            startsAt: now,
+            expiresAt,
+            autoRenew: false
+          }
+        });
+
+        return {
+          paymentId: payment.id,
+          userId: payment.user.id,
+          deliveryChatId:
+            payment.user.deliveryChatId,
+          planCode,
+          expiresAt,
+          alreadyActivated: false
+        };
+      }
+    );
+
+  if (!result.alreadyActivated) {
+    const plan =
+      PLAN_DEFINITIONS[
+        result.planCode
+      ];
+
+    await enforceUserPlanLimits(
+      result.userId,
+      plan
+    );
+
+    await notifyBotUser(
+      result.deliveryChatId,
+      [
+        "✅ Оплата подтверждена.",
+        "",
+        `Тариф: ${plan.label}`,
+        `Доступ до: ${formatAccessDate(
+          result.expiresAt
+        )}`,
+        "",
+        "Подписка активирована.",
+        "Проверить: /subscription"
+      ].join("\n")
+    );
+  }
+
+  return result;
 }
 
 function addDaysToDate(
@@ -5304,6 +6092,737 @@ bot.callbackQuery(
   }
 );
 
+function parsePaymentPlanCallbackData(
+  data: string
+): PaidPlanCode | null {
+  const parts =
+    data.split(":");
+
+  if (
+    parts.length !== 3 ||
+    parts[0] !== "payment" ||
+    parts[1] !== "plan"
+  ) {
+    return null;
+  }
+
+  return parsePaidPlanCode(
+    parts[2]
+  );
+}
+
+function parsePaymentProviderCallbackData(
+  data: string
+): {
+  provider: PaymentProvider;
+  planCode: PaidPlanCode;
+} | null {
+  const parts =
+    data.split(":");
+
+  if (
+    parts.length !== 4 ||
+    parts[0] !== "payment" ||
+    parts[1] !== "provider"
+  ) {
+    return null;
+  }
+
+  let provider: PaymentProvider;
+
+  switch (parts[2]) {
+    case "TELEGRAM_STARS":
+      provider =
+        PaymentProvider.TELEGRAM_STARS;
+      break;
+    case "YOOKASSA":
+      provider =
+        PaymentProvider.YOOKASSA;
+      break;
+    case "ROBOKASSA":
+      provider =
+        PaymentProvider.ROBOKASSA;
+      break;
+    default:
+      return null;
+  }
+
+  const planCode =
+    parsePaidPlanCode(
+      parts[3]
+    );
+
+  if (!planCode) {
+    return null;
+  }
+
+  return {
+    provider,
+    planCode
+  };
+}
+
+bot.callbackQuery(
+  /^payment:plan:(START|PRO)$/,
+  async (ctx) => {
+    const planCode =
+      parsePaymentPlanCallbackData(
+        ctx.callbackQuery.data
+      );
+
+    if (!planCode) {
+      await ctx.answerCallbackQuery({
+        text: "Некорректный тариф",
+        show_alert: true
+      });
+      return;
+    }
+
+    const user =
+      await getCurrentBotUser(ctx);
+
+    if (!user) {
+      await ctx.answerCallbackQuery({
+        text: "Сначала выполните /start",
+        show_alert: true
+      });
+      return;
+    }
+
+    if (!user.isActive) {
+      await ctx.answerCallbackQuery({
+        text: "Аккаунт отключён",
+        show_alert: true
+      });
+      return;
+    }
+
+    if (
+      user.role ===
+      UserRole.OWNER
+    ) {
+      await ctx.answerCallbackQuery({
+        text: "У владельца бессрочный доступ",
+        show_alert: true
+      });
+      return;
+    }
+
+    await ctx.answerCallbackQuery();
+
+    await replyWithPaymentMethods(
+      ctx,
+      planCode
+    );
+  }
+);
+
+bot.callbackQuery(
+  /^payment:provider:(TELEGRAM_STARS|YOOKASSA|ROBOKASSA):(START|PRO)$/,
+  async (ctx) => {
+    const selection =
+      parsePaymentProviderCallbackData(
+        ctx.callbackQuery.data
+      );
+
+    if (!selection) {
+      await ctx.answerCallbackQuery({
+        text: "Некорректный способ оплаты",
+        show_alert: true
+      });
+      return;
+    }
+
+    const user =
+      await getCurrentBotUser(ctx);
+
+    if (!user) {
+      await ctx.answerCallbackQuery({
+        text: "Сначала выполните /start",
+        show_alert: true
+      });
+      return;
+    }
+
+    if (!user.isActive) {
+      await ctx.answerCallbackQuery({
+        text: "Аккаунт отключён",
+        show_alert: true
+      });
+      return;
+    }
+
+    if (
+      user.role ===
+      UserRole.OWNER
+    ) {
+      await ctx.answerCallbackQuery({
+        text: "У владельца бессрочный доступ",
+        show_alert: true
+      });
+      return;
+    }
+
+    const offer =
+      PAYMENT_OFFERS[
+        selection.planCode
+      ];
+
+    const configuredAmount =
+      getConfiguredPaymentAmount(
+        selection.provider,
+        offer
+      );
+
+    if (!configuredAmount) {
+      await ctx.answerCallbackQuery({
+        text:
+          selection.provider ===
+          PaymentProvider.TELEGRAM_STARS
+            ? "Цена в Stars пока не настроена"
+            : "Цена в рублях пока не настроена",
+        show_alert: true
+      });
+      return;
+    }
+
+    try {
+      const payment =
+        await createPaymentRecord(
+          user.id,
+          selection.provider,
+          selection.planCode
+        );
+
+      if (!payment) {
+        await ctx.answerCallbackQuery({
+          text: "Цена не настроена",
+          show_alert: true
+        });
+        return;
+      }
+
+      const plan =
+        PLAN_DEFINITIONS[
+          selection.planCode
+        ];
+
+      if (
+        selection.provider ===
+        PaymentProvider.TELEGRAM_STARS
+      ) {
+        await sendTelegramStarsInvoice(
+          ctx,
+          payment,
+          selection.planCode
+        );
+
+        await ctx.answerCallbackQuery({
+          text: "Счёт в Telegram Stars создан"
+        });
+
+        return;
+      }
+
+      await ctx.answerCallbackQuery({
+        text: "Платёж подготовлен"
+      });
+
+      await ctx.reply(
+        [
+          "🧾 <b>Платёжная запись создана</b>",
+          "",
+          `Тариф: ${escapeHtml(plan.label)}`,
+          `Способ: ${escapeHtml(
+            getPaymentProviderLabel(
+              selection.provider
+            )
+          )}`,
+          `Сумма: ${escapeHtml(
+            formatRubPrice(
+              configuredAmount.amountMinor
+            )
+          )}`,
+          `Срок: ${payment.durationDays} дн.`,
+          "",
+          `ID заказа: <code>${escapeHtml(
+            payment.id
+          )}</code>`,
+          "",
+          "Подключение API этого провайдера будет выполнено следующим этапом."
+        ].join("\n"),
+        {
+          parse_mode: "HTML"
+        }
+      );
+    } catch (error) {
+      console.error(
+        "PAYMENT_CREATE_ERROR",
+        {
+          userId: user.id,
+          provider:
+            selection.provider,
+          planCode:
+            selection.planCode,
+          error
+        }
+      );
+
+      await ctx.answerCallbackQuery({
+        text: "Не удалось подготовить платёж",
+        show_alert: true
+      });
+    }
+  }
+);
+
+bot.on(
+  "pre_checkout_query",
+  async (ctx) => {
+    const query =
+      ctx.preCheckoutQuery;
+
+    const paymentId =
+      parseTelegramStarsInvoicePayload(
+        query.invoice_payload
+      );
+
+    if (!paymentId) {
+      await ctx.answerPreCheckoutQuery(
+        false,
+        "Некорректный платёжный заказ."
+      );
+      return;
+    }
+
+    try {
+      const payment =
+        await prisma.payment.findUnique({
+          where: {
+            id: paymentId
+          },
+          include: {
+            user: {
+              select: {
+                telegramId: true,
+                role: true,
+                isActive: true
+              }
+            }
+          }
+        });
+
+      if (!payment) {
+        await ctx.answerPreCheckoutQuery(
+          false,
+          "Платёжный заказ не найден."
+        );
+        return;
+      }
+
+      if (
+        payment.provider !==
+        PaymentProvider.TELEGRAM_STARS
+      ) {
+        await ctx.answerPreCheckoutQuery(
+          false,
+          "Для заказа выбран другой способ оплаты."
+        );
+        return;
+      }
+
+      if (
+        payment.expiresAt.getTime() <=
+        Date.now()
+      ) {
+        await ctx.answerPreCheckoutQuery(
+          false,
+          "Срок действия счёта истёк. Создайте новый заказ через /plans."
+        );
+
+        await prisma.payment.updateMany({
+          where: {
+            id: payment.id,
+            activatedAt: null,
+            status: {
+              in: [
+                PaymentStatus.CREATED,
+                PaymentStatus.PENDING
+              ]
+            }
+          },
+          data: {
+            status:
+              PaymentStatus.EXPIRED,
+            failureReason:
+              "Истёк срок действия платёжного заказа"
+          }
+        }).catch((error) => {
+          console.error(
+            "PAYMENT_EXPIRY_UPDATE_ERROR",
+            {
+              paymentId:
+                payment.id,
+              error
+            }
+          );
+        });
+
+        return;
+      }
+
+      if (
+        payment.status !==
+          PaymentStatus.CREATED &&
+        payment.status !==
+          PaymentStatus.PENDING
+      ) {
+        await ctx.answerPreCheckoutQuery(
+          false,
+          "Этот заказ уже обработан или недоступен."
+        );
+        return;
+      }
+
+      if (payment.activatedAt) {
+        await ctx.answerPreCheckoutQuery(
+          false,
+          "Подписка по этому заказу уже активирована."
+        );
+        return;
+      }
+
+      if (
+        payment.user.role ===
+        UserRole.OWNER
+      ) {
+        await ctx.answerPreCheckoutQuery(
+          false,
+          "Владельцу не требуется платная подписка."
+        );
+        return;
+      }
+
+      if (!payment.user.isActive) {
+        await ctx.answerPreCheckoutQuery(
+          false,
+          "Аккаунт отключён. Обратитесь к владельцу бота."
+        );
+        return;
+      }
+
+      if (
+        payment.user.telegramId !==
+        String(query.from.id)
+      ) {
+        await ctx.answerPreCheckoutQuery(
+          false,
+          "Этот счёт создан для другого пользователя."
+        );
+        return;
+      }
+
+      if (
+        query.currency !== "XTR" ||
+        payment.currency !== "XTR"
+      ) {
+        await ctx.answerPreCheckoutQuery(
+          false,
+          "Некорректная валюта платежа."
+        );
+        return;
+      }
+
+      if (
+        query.total_amount !==
+        payment.amountMinor
+      ) {
+        await ctx.answerPreCheckoutQuery(
+          false,
+          "Сумма платежа не совпадает с заказом."
+        );
+        return;
+      }
+
+      await ctx.answerPreCheckoutQuery(
+        true
+      );
+
+      await prisma.payment.updateMany({
+        where: {
+          id: payment.id,
+          status: PaymentStatus.CREATED,
+          activatedAt: null
+        },
+        data: {
+          status: PaymentStatus.PENDING
+        }
+      }).catch((error) => {
+        console.error(
+          "TELEGRAM_STARS_PENDING_UPDATE_ERROR",
+          {
+            paymentId: payment.id,
+            error
+          }
+        );
+      });
+    } catch (error) {
+      console.error(
+        "TELEGRAM_STARS_PRE_CHECKOUT_ERROR",
+        {
+          paymentId,
+          telegramId:
+            String(query.from.id),
+          error
+        }
+      );
+
+      await ctx.answerPreCheckoutQuery(
+        false,
+        "Не удалось проверить заказ. Повторите попытку позже."
+      ).catch(() => undefined);
+    }
+  }
+);
+
+bot.on(
+  "message:successful_payment",
+  async (ctx) => {
+    const successfulPayment =
+      ctx.message.successful_payment;
+
+    const paymentId =
+      parseTelegramStarsInvoicePayload(
+        successfulPayment.invoice_payload
+      );
+
+    if (!paymentId) {
+      console.error(
+        "TELEGRAM_STARS_INVALID_SUCCESS_PAYLOAD",
+        {
+          telegramId:
+            String(ctx.from.id),
+          payload:
+            successfulPayment.invoice_payload
+        }
+      );
+
+      await ctx.reply(
+        [
+          "⚠️ Оплата получена, но заказ не удалось определить.",
+          "",
+          "Обратитесь в поддержку: /paysupport"
+        ].join("\n")
+      );
+
+      return;
+    }
+
+    let paymentEventId:
+      string | null = null;
+
+    try {
+      const payment =
+        await prisma.payment.findUnique({
+          where: {
+            id: paymentId
+          },
+          include: {
+            user: {
+              select: {
+                telegramId: true,
+                role: true
+              }
+            }
+          }
+        });
+
+      if (!payment) {
+        throw new Error(
+          `Платёж не найден: ${paymentId}`
+        );
+      }
+
+      if (
+        payment.provider !==
+        PaymentProvider.TELEGRAM_STARS
+      ) {
+        throw new Error(
+          "Провайдер платежа не соответствует Telegram Stars"
+        );
+      }
+
+      if (
+        payment.user.telegramId !==
+        String(ctx.from.id)
+      ) {
+        throw new Error(
+          "Telegram ID плательщика не совпадает с заказом"
+        );
+      }
+
+      if (
+        payment.user.role ===
+        UserRole.OWNER
+      ) {
+        throw new Error(
+          "Владельцу не требуется платная подписка"
+        );
+      }
+
+      if (
+        successfulPayment.currency !==
+          "XTR" ||
+        payment.currency !== "XTR"
+      ) {
+        throw new Error(
+          "Некорректная валюта успешного платежа"
+        );
+      }
+
+      if (
+        successfulPayment.total_amount !==
+        payment.amountMinor
+      ) {
+        throw new Error(
+          "Сумма успешного платежа не совпадает с заказом"
+        );
+      }
+
+      const telegramChargeId =
+        successfulPayment
+          .telegram_payment_charge_id;
+
+      const externalEventKey =
+        `successful_payment:${telegramChargeId}`;
+
+      const paymentEvent =
+        await prisma.paymentEvent.upsert({
+          where: {
+            provider_externalEventKey: {
+              provider:
+                PaymentProvider.TELEGRAM_STARS,
+              externalEventKey
+            }
+          },
+          update: {
+            paymentId: payment.id
+          },
+          create: {
+            paymentId: payment.id,
+            provider:
+              PaymentProvider.TELEGRAM_STARS,
+            externalEventKey,
+            eventType:
+              "successful_payment",
+            payload: {
+              paymentId: payment.id,
+              telegramId:
+                String(ctx.from.id),
+              currency:
+                successfulPayment.currency,
+              totalAmount:
+                successfulPayment.total_amount,
+              invoicePayload:
+                successfulPayment.invoice_payload,
+              telegramPaymentChargeId:
+                telegramChargeId,
+              providerPaymentChargeId:
+                successfulPayment
+                  .provider_payment_charge_id
+            }
+          }
+        });
+
+      paymentEventId =
+        paymentEvent.id;
+
+      const activation =
+        await activateSubscriptionFromPayment(
+          payment.id,
+          telegramChargeId
+        );
+
+      await prisma.paymentEvent.update({
+        where: {
+          id: paymentEvent.id
+        },
+        data: {
+          processedAt: new Date(),
+          processingError: null
+        }
+      });
+
+      if (!activation.alreadyActivated) {
+        const plan =
+          PLAN_DEFINITIONS[
+            activation.planCode
+          ];
+
+        await bot.api.sendMessage(
+          adminTargetChatId,
+          [
+            "💰 Оплата Telegram Stars",
+            "",
+            `Пользователь: ${payment.user.telegramId}`,
+            `Тариф: ${plan.label}`,
+            `Сумма: ${payment.amountMinor} Stars`,
+            `Заказ: ${payment.id}`,
+            `Charge ID: ${telegramChargeId}`,
+            `Доступ до: ${formatAccessDate(
+              activation.expiresAt
+            )}`
+          ].join("\n")
+        ).catch((error) => {
+          console.error(
+            "TELEGRAM_STARS_OWNER_NOTIFY_ERROR",
+            {
+              paymentId:
+                payment.id,
+              error
+            }
+          );
+        });
+      }
+    } catch (error) {
+      console.error(
+        "TELEGRAM_STARS_SUCCESS_ERROR",
+        {
+          paymentId,
+          paymentEventId,
+          telegramId:
+            String(ctx.from.id),
+          error
+        }
+      );
+
+      if (paymentEventId) {
+        await prisma.paymentEvent.update({
+          where: {
+            id: paymentEventId
+          },
+          data: {
+            processingError:
+              error instanceof Error
+                ? error.message
+                : String(error)
+          }
+        }).catch(() => undefined);
+      }
+
+      await ctx.reply(
+        [
+          "⚠️ Оплата получена, но подписка требует ручной проверки.",
+          "",
+          `ID заказа: ${paymentId}`,
+          "",
+          "Обратитесь в поддержку: /paysupport"
+        ].join("\n")
+      );
+    }
+  }
+);
+
 async function getTriggerCallbackUser(
   ctx: Context
 ) {
@@ -6441,6 +7960,14 @@ async function setupBotCommands(): Promise<void> {
       description: "Доступные тарифы"
     },
     {
+      command: "paysupport",
+      description: "Поддержка по оплате"
+    },
+    {
+      command: "terms",
+      description: "Условия использования и оплаты"
+    },
+    {
       command: "triggers",
       description: "Мои персональные триггеры"
     },
@@ -6518,6 +8045,8 @@ async function setupBotCommands(): Promise<void> {
     { command: "profile", description: "Профиль и использование" },
     { command: "subscription", description: "Состояние подписки" },
     { command: "plans", description: "Доступные тарифы" },
+    { command: "paysupport", description: "Поддержка по оплате" },
+    { command: "terms", description: "Условия использования и оплаты" },
     { command: "triggers", description: "Персональные триггеры" },
     { command: "addtrigger", description: "Добавить триггер" },
     { command: "removetrigger", description: "Удалить триггер" },

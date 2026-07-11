@@ -44,6 +44,22 @@ enum LeadDeliveryType {
   USER_TRIGGER
 }
 
+enum PaymentProvider {
+  TELEGRAM_STARS
+  YOOKASSA
+  ROBOKASSA
+}
+
+enum PaymentStatus {
+  CREATED
+  PENDING
+  SUCCEEDED
+  CANCELED
+  FAILED
+  EXPIRED
+  REFUNDED
+}
+
 model Lead {
   id String @id @default(cuid())
 
@@ -136,6 +152,7 @@ model BotUser {
   triggers     UserTrigger[]
   sourceChats  UserSourceChat[]
   deliveries   LeadDelivery[]
+  payments     Payment[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -162,6 +179,80 @@ model Subscription {
 
   @@index([status])
   @@index([expiresAt])
+}
+
+model Payment {
+  id     String @id @default(cuid())
+  userId String
+
+  provider PaymentProvider
+  status   PaymentStatus   @default(CREATED)
+
+  // Покупаемый тариф и срок доступа.
+  planCode     String
+  durationDays Int    @default(30)
+
+  // Для RUB сумма хранится в копейках.
+  // Для XTR значение равно количеству Telegram Stars.
+  amountMinor Int
+  currency    String
+
+  // ID платежа у Telegram, ЮKassa или Robokassa.
+  providerPaymentId String?
+
+  // Внутренний ключ предотвращает повторное создание заказа.
+  idempotencyKey String @unique
+
+  confirmationUrl String?
+
+  // После этого времени новый платёж по заказу не принимается.
+  expiresAt DateTime
+
+  paidAt      DateTime?
+  activatedAt DateTime?
+  refundedAt  DateTime?
+
+  failureReason String?
+  metadata      Json?
+
+  user   BotUser        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  events PaymentEvent[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([provider, providerPaymentId])
+  @@index([userId, createdAt])
+  @@index([provider, status])
+  @@index([status, createdAt])
+  @@index([status, expiresAt])
+}
+
+model PaymentEvent {
+  id        String  @id @default(cuid())
+  paymentId String?
+
+  provider PaymentProvider
+
+  // Вычисляемый уникальный ключ входящего события:
+  // Telegram: successful_payment:<charge_id>
+  // ЮKassa: <event_type>:<payment_id>
+  // Robokassa: result:<InvId>:<OutSum>
+  externalEventKey String
+  eventType        String
+
+  payload Json
+
+  processedAt     DateTime?
+  processingError String?
+
+  payment Payment? @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+
+  @@unique([provider, externalEventKey])
+  @@index([paymentId, createdAt])
+  @@index([provider, processedAt])
 }
 
 model UserTrigger {
