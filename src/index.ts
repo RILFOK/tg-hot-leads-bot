@@ -62,6 +62,115 @@ if (!Number.isInteger(trialDays) || trialDays <= 0) {
   throw new Error("TRIAL_DAYS должен быть положительным целым числом");
 }
 
+type PlanCode =
+  | "OWNER"
+  | "TRIAL"
+  | "START"
+  | "PRO"
+  | "MANUAL";
+
+type PlanDefinition = {
+  code: PlanCode;
+  label: string;
+  maxTriggers: number | null;
+  maxSources: number | null;
+};
+
+const PLAN_DEFINITIONS: Record<
+  PlanCode,
+  PlanDefinition
+> = {
+  OWNER: {
+    code: "OWNER",
+    label: "Владелец",
+    maxTriggers: null,
+    maxSources: null
+  },
+  TRIAL: {
+    code: "TRIAL",
+    label: "Пробный",
+    maxTriggers: 5,
+    maxSources: 2
+  },
+  START: {
+    code: "START",
+    label: "Start",
+    maxTriggers: 20,
+    maxSources: 5
+  },
+  PRO: {
+    code: "PRO",
+    label: "Pro",
+    maxTriggers: 100,
+    maxSources: 20
+  },
+  MANUAL: {
+    code: "MANUAL",
+    label: "Ручная подписка",
+    maxTriggers: 20,
+    maxSources: 5
+  }
+};
+
+function resolvePlanCode(user: {
+  role: UserRole;
+  subscription: {
+    planCode?: string | null;
+  } | null;
+}): PlanCode {
+  if (user.role === UserRole.OWNER) {
+    return "OWNER";
+  }
+
+  const rawPlanCode =
+    user.subscription?.planCode
+      ?.trim()
+      .toUpperCase();
+
+  if (!rawPlanCode) {
+    return "TRIAL";
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(
+      PLAN_DEFINITIONS,
+      rawPlanCode
+    )
+  ) {
+    return rawPlanCode as PlanCode;
+  }
+
+  // Неизвестный вручную созданный тариф получает
+  // безопасные лимиты MANUAL, а не пробные лимиты.
+  return "MANUAL";
+}
+
+function getPlanDefinition(user: {
+  role: UserRole;
+  subscription: {
+    planCode?: string | null;
+  } | null;
+}): PlanDefinition {
+  return PLAN_DEFINITIONS[resolvePlanCode(user)];
+}
+
+function formatPlanLimit(
+  limit: number | null
+): string {
+  return limit === null
+    ? "без ограничений"
+    : String(limit);
+}
+
+function formatPlanUsage(
+  current: number,
+  limit: number | null
+): string {
+  return limit === null
+    ? `${current} / без ограничений`
+    : `${current} / ${limit}`;
+}
+
 const adapter = new PrismaPg({
   connectionString: databaseUrl
 });
@@ -655,8 +764,7 @@ async function registerBotUser(ctx: Context) {
       firstName: from.first_name ?? null,
       lastName: from.last_name ?? null,
       deliveryChatId: String(chat.id),
-      role: isOwner ? UserRole.OWNER : UserRole.USER,
-      isActive: true
+      role: isOwner ? UserRole.OWNER : UserRole.USER
     },
     create: {
       telegramId,
@@ -671,6 +779,7 @@ async function registerBotUser(ctx: Context) {
       id: true,
       telegramId: true,
       role: true,
+      isActive: true,
       deliveryChatId: true
     }
   });
@@ -749,6 +858,9 @@ async function getCurrentBotUser(ctx: Context) {
     select: {
       id: true,
       telegramId: true,
+      username: true,
+      firstName: true,
+      lastName: true,
       role: true,
       isActive: true,
       deliveryChatId: true,
@@ -756,7 +868,9 @@ async function getCurrentBotUser(ctx: Context) {
         select: {
           planCode: true,
           status: true,
-          expiresAt: true
+          startsAt: true,
+          expiresAt: true,
+          autoRenew: true
         }
       }
     }
@@ -954,6 +1068,161 @@ function hasSubscriptionAccess(user: {
   return true;
 }
 
+type PlanLimitEnforcementResult = {
+  disabledTriggerCount: number;
+  disabledSourceCount: number;
+};
+
+async function enforceUserPlanLimits(
+  userId: string,
+  plan: PlanDefinition
+): Promise<PlanLimitEnforcementResult> {
+  let disabledTriggerCount = 0;
+  let disabledSourceCount = 0;
+
+  if (plan.maxTriggers !== null) {
+    const activeTriggers =
+      await prisma.userTrigger.findMany({
+        where: {
+          userId,
+          isActive: true
+        },
+        orderBy: [
+          {
+            createdAt: "asc"
+          },
+          {
+            id: "asc"
+          }
+        ],
+        select: {
+          id: true
+        }
+      });
+
+    const overflowTriggerIds =
+      activeTriggers
+        .slice(plan.maxTriggers)
+        .map((trigger) => trigger.id);
+
+    if (overflowTriggerIds.length) {
+      const result =
+        await prisma.userTrigger.updateMany({
+          where: {
+            userId,
+            id: {
+              in: overflowTriggerIds
+            }
+          },
+          data: {
+            isActive: false
+          }
+        });
+
+      disabledTriggerCount = result.count;
+    }
+  }
+
+  if (plan.maxSources !== null) {
+    const activeSources =
+      await prisma.userSourceChat.findMany({
+        where: {
+          userId,
+          isActive: true,
+          sourceChat: {
+            isBlocked: false
+          }
+        },
+        orderBy: [
+          {
+            createdAt: "asc"
+          },
+          {
+            id: "asc"
+          }
+        ],
+        select: {
+          id: true
+        }
+      });
+
+    const overflowSourceIds =
+      activeSources
+        .slice(plan.maxSources)
+        .map((source) => source.id);
+
+    if (overflowSourceIds.length) {
+      const result =
+        await prisma.userSourceChat.updateMany({
+          where: {
+            userId,
+            id: {
+              in: overflowSourceIds
+            }
+          },
+          data: {
+            isActive: false
+          }
+        });
+
+      disabledSourceCount = result.count;
+    }
+  }
+
+  return {
+    disabledTriggerCount,
+    disabledSourceCount
+  };
+}
+
+async function enforceAllUserPlanLimits(): Promise<void> {
+  const users =
+    await prisma.botUser.findMany({
+      where: {
+        role: UserRole.USER
+      },
+      select: {
+        id: true,
+        telegramId: true,
+        role: true,
+        subscription: {
+          select: {
+            planCode: true
+          }
+        }
+      }
+    });
+
+  for (const user of users) {
+    const plan =
+      getPlanDefinition(user);
+
+    const result =
+      await enforceUserPlanLimits(
+        user.id,
+        plan
+      );
+
+    if (
+      result.disabledTriggerCount > 0 ||
+      result.disabledSourceCount > 0
+    ) {
+      console.log(
+        "USER_PLAN_LIMITS_ENFORCED",
+        {
+          userId: user.id,
+          telegramId: user.telegramId,
+          planCode: plan.code,
+          disabledTriggerCount:
+            result.disabledTriggerCount,
+          disabledSourceCount:
+            result.disabledSourceCount
+        }
+      );
+    }
+  }
+}
+
 async function getRegisteredUserByTelegramId(
   telegramId: string
 ) {
@@ -969,6 +1238,7 @@ async function getRegisteredUserByTelegramId(
       deliveryChatId: true,
       subscription: {
         select: {
+          planCode: true,
           status: true,
           expiresAt: true
         }
@@ -2489,7 +2759,18 @@ bot.command("start", async (ctx) => {
   }
 
   if (!assertAdmin(ctx)) {
-    const { subscription } = registration;
+    const { user, subscription } = registration;
+
+    if (!user.isActive) {
+      await ctx.reply(
+        [
+          "🚫 Ваш аккаунт отключён.",
+          "",
+          "Для восстановления доступа обратитесь к владельцу бота."
+        ].join("\n")
+      );
+      return;
+    }
 
     await ctx.reply(
       [
@@ -2502,6 +2783,9 @@ bot.command("start", async (ctx) => {
         `Доступ до: ${formatAccessDate(subscription.expiresAt)}`,
         "",
         "Доступные команды:",
+        "/profile — профиль и использование",
+        "/subscription — состояние подписки",
+        "/plans — доступные тарифы",
         "/triggers — мои триггеры",
         "/addtrigger фраза — добавить триггер",
         "/removetrigger фраза — удалить триггер",
@@ -2535,12 +2819,15 @@ bot.command("start", async (ctx) => {
       "Доступ: бессрочный",
       "",
       "Команды:",
+      "/profile — профиль и использование",
+      "/subscription — состояние подписки",
+      "/plans — доступные тарифы",
       "/triggers — персональные триггеры",
       "/addtrigger фраза — добавить триггер",
       "/removetrigger фраза — удалить триггер",
       "/users — пользователи бота",
       "/user telegram_id — карточка пользователя",
-      "/grant telegram_id дни — выдать подписку",
+      "/grant telegram_id START|PRO дни — выдать подписку",
       "/extend telegram_id дни — продлить подписку",
       "/revoke telegram_id — отменить подписку",
       "/blockuser telegram_id — отключить аккаунт",
@@ -2596,6 +2883,18 @@ bot.command("triggers", async (ctx) => {
     return;
   }
 
+  if (!hasSubscriptionAccess(user)) {
+    await ctx.reply(
+      [
+        "Ваша подписка неактивна или закончилась.",
+        "",
+        "Проверить подписку: /subscription",
+        "Посмотреть тарифы: /plans"
+      ].join("\n")
+    );
+    return;
+  }
+
   await replyWithUserTriggers(ctx, user.id);
 });
 
@@ -2612,6 +2911,18 @@ bot.command("addtrigger", async (ctx) => {
   if (!user.isActive) {
     await ctx.reply(
       "Ваш аккаунт отключён. Обратитесь к администратору."
+    );
+    return;
+  }
+
+  if (!hasSubscriptionAccess(user)) {
+    await ctx.reply(
+      [
+        "Ваша подписка неактивна или закончилась.",
+        "",
+        "Проверить подписку: /subscription",
+        "Посмотреть тарифы: /plans"
+      ].join("\n")
     );
     return;
   }
@@ -2666,21 +2977,33 @@ bot.command("addtrigger", async (ctx) => {
         }
       },
       select: {
-        id: true
+        id: true,
+        isActive: true
       }
     });
 
-  if (!existingTrigger) {
+  if (!existingTrigger?.isActive) {
     const triggerCount =
       await prisma.userTrigger.count({
         where: {
-          userId: user.id
+          userId: user.id,
+          isActive: true
         }
       });
 
-    if (triggerCount >= 20) {
+    const plan = getPlanDefinition(user);
+
+    if (
+      plan.maxTriggers !== null &&
+      triggerCount >= plan.maxTriggers
+    ) {
       await ctx.reply(
-        "Достигнут лимит: максимум 20 триггеров."
+        [
+          `Достигнут лимит тарифа ${plan.label}.`,
+          "",
+          `Активных триггеров: ${triggerCount} / ${plan.maxTriggers}`,
+          "Другие тарифы: /plans"
+        ].join("\n")
       );
       return;
     }
@@ -2729,6 +3052,18 @@ bot.command("removetrigger", async (ctx) => {
   if (!user) {
     await ctx.reply(
       "Сначала зарегистрируйтесь через /start."
+    );
+    return;
+  }
+
+  if (!hasSubscriptionAccess(user)) {
+    await ctx.reply(
+      [
+        "Ваша подписка неактивна или закончилась.",
+        "",
+        "Проверить подписку: /subscription",
+        "Посмотреть тарифы: /plans"
+      ].join("\n")
     );
     return;
   }
@@ -2850,6 +3185,57 @@ bot.command("connectchat", async (ctx) => {
   }
 
   await trackSourceChat(ctx);
+
+  if (await isSourceChatBlocked(ctx)) {
+    await ctx.reply(
+      "Этот источник заблокирован владельцем бота."
+    );
+    return;
+  }
+
+  const existingConnection =
+    await prisma.userSourceChat.findUnique({
+      where: {
+        userId_chatId: {
+          userId: user.id,
+          chatId: String(chat.id)
+        }
+      },
+      select: {
+        isActive: true
+      }
+    });
+
+  if (!existingConnection?.isActive) {
+    const activeSourceCount =
+      await prisma.userSourceChat.count({
+        where: {
+          userId: user.id,
+          isActive: true,
+          sourceChat: {
+            isBlocked: false
+          }
+        }
+      });
+
+    const plan = getPlanDefinition(user);
+
+    if (
+      plan.maxSources !== null &&
+      activeSourceCount >= plan.maxSources
+    ) {
+      await ctx.reply(
+        [
+          `Достигнут лимит тарифа ${plan.label}.`,
+          "",
+          `Активных источников: ${activeSourceCount} / ${plan.maxSources}`,
+          "Отключить источник: /disconnectchat",
+          "Другие тарифы: /plans"
+        ].join("\n")
+      );
+      return;
+    }
+  }
 
   await prisma.userSourceChat.upsert({
     where: {
@@ -2996,6 +3382,172 @@ bot.command("disconnectchat", async (ctx) => {
   );
 });
 
+
+async function replyWithSubscriptionProfile(
+  ctx: Context,
+  title: string
+): Promise<void> {
+  const user = await getCurrentBotUser(ctx);
+
+  if (!user) {
+    await ctx.reply(
+      "Откройте личный чат с ботом и выполните /start."
+    );
+    return;
+  }
+
+  const [
+    activeTriggerCount,
+    activeSourceCount,
+    deliveryCount
+  ] = await Promise.all([
+    prisma.userTrigger.count({
+      where: {
+        userId: user.id,
+        isActive: true
+      }
+    }),
+    prisma.userSourceChat.count({
+      where: {
+        userId: user.id,
+        isActive: true,
+        sourceChat: {
+          isBlocked: false
+        }
+      }
+    }),
+    prisma.leadDelivery.count({
+      where: {
+        recipientUserId: user.id
+      }
+    })
+  ]);
+
+  const plan = getPlanDefinition(user);
+  const hasAccess = hasSubscriptionAccess(user);
+
+  const expiredByDate = Boolean(
+    user.subscription?.expiresAt &&
+    user.subscription.expiresAt.getTime() <= Date.now()
+  );
+
+  const statusLabel = expiredByDate
+    ? "Истекла"
+    : getSubscriptionStatusLabel(
+        user.subscription?.status ?? null
+      );
+
+  const displayName = getBotUserDisplayName({
+    username: user.username,
+    firstName: user.firstName,
+    lastName: user.lastName,
+    telegramId: user.telegramId
+  });
+
+  await ctx.reply(
+    [
+      `${title}`,
+      "",
+      `<b>${escapeHtml(displayName)}</b>`,
+      `Telegram ID: <code>${escapeHtml(user.telegramId)}</code>`,
+      `Роль: ${escapeHtml(getUserRoleLabel(user.role))}`,
+      `Аккаунт: ${user.isActive ? "✅ активен" : "🚫 заблокирован"}`,
+      "",
+      "💳 <b>Подписка</b>",
+      `Тариф: ${escapeHtml(plan.label)} (<code>${escapeHtml(plan.code)}</code>)`,
+      `Статус: ${escapeHtml(statusLabel)}`,
+      `Доступ: ${hasAccess ? "✅ разрешён" : "⛔ приостановлен"}`,
+      `Начало: ${escapeHtml(
+        formatAccessDate(
+          user.subscription?.startsAt ?? null
+        )
+      )}`,
+      `Окончание: ${escapeHtml(
+        formatAccessDate(
+          user.subscription?.expiresAt ?? null
+        )
+      )}`,
+      `Автопродление: ${
+        user.subscription?.autoRenew
+          ? "включено"
+          : "выключено"
+      }`,
+      "",
+      "📊 <b>Использование</b>",
+      `Триггеры: ${escapeHtml(
+        formatPlanUsage(
+          activeTriggerCount,
+          plan.maxTriggers
+        )
+      )}`,
+      `Активные источники: ${escapeHtml(
+        formatPlanUsage(
+          activeSourceCount,
+          plan.maxSources
+        )
+      )}`,
+      `Получено лидов: ${deliveryCount}`,
+      "",
+      hasAccess
+        ? "Бот готов принимать персональные лиды."
+        : "Для восстановления доступа обратитесь к владельцу бота."
+    ].join("\n"),
+    {
+      parse_mode: "HTML"
+    }
+  );
+}
+
+bot.command("profile", async (ctx) => {
+  await replyWithSubscriptionProfile(
+    ctx,
+    "👤 <b>Мой профиль</b>"
+  );
+});
+
+bot.command("subscription", async (ctx) => {
+  await replyWithSubscriptionProfile(
+    ctx,
+    "💳 <b>Моя подписка</b>"
+  );
+});
+
+bot.command("plans", async (ctx) => {
+  const trial = PLAN_DEFINITIONS.TRIAL;
+  const start = PLAN_DEFINITIONS.START;
+  const pro = PLAN_DEFINITIONS.PRO;
+
+  await ctx.reply(
+    [
+      "💳 <b>Тарифы бота</b>",
+      "",
+      `🧪 <b>${escapeHtml(trial.label)}</b>`,
+      `Срок: ${trialDays} дней`,
+      `Триггеры: ${formatPlanLimit(trial.maxTriggers)}`,
+      `Источники: ${formatPlanLimit(trial.maxSources)}`,
+      "",
+      `🚀 <b>${escapeHtml(start.label)}</b>`,
+      `Триггеры: ${formatPlanLimit(start.maxTriggers)}`,
+      `Источники: ${formatPlanLimit(start.maxSources)}`,
+      "",
+      `💼 <b>${escapeHtml(pro.label)}</b>`,
+      `Триггеры: ${formatPlanLimit(pro.maxTriggers)}`,
+      `Источники: ${formatPlanLimit(pro.maxSources)}`,
+      "",
+      "Во всех тарифах доступны:",
+      "• персональные триггеры;",
+      "• уведомления о новых заявках;",
+      "• статусы и работа с лидами;",
+      "• архив, корзина и заметки;",
+      "",
+      "Стоимость и подключение тарифа — через владельца бота."
+    ].join("\n"),
+    {
+      parse_mode: "HTML"
+    }
+  );
+});
+
 function parseSubscriptionDays(
   rawValue: string | undefined
 ): number | null {
@@ -3014,6 +3566,26 @@ function parseSubscriptionDays(
   }
 
   return days;
+}
+
+type PaidPlanCode =
+  | "START"
+  | "PRO";
+
+function parsePaidPlanCode(
+  rawValue: string | undefined
+): PaidPlanCode | null {
+  const planCode =
+    rawValue?.trim().toUpperCase();
+
+  if (
+    planCode === "START" ||
+    planCode === "PRO"
+  ) {
+    return planCode;
+  }
+
+  return null;
 }
 
 function addDaysToDate(
@@ -3048,6 +3620,24 @@ function getSubscriptionStatusLabel(
     default:
       return "Не оформлена";
   }
+}
+
+function getEffectiveSubscriptionStatusLabel(
+  status: SubscriptionStatus | null,
+  expiresAt: Date | null
+): string {
+  if (
+    expiresAt &&
+    expiresAt.getTime() <= Date.now() &&
+    (
+      status === SubscriptionStatus.TRIAL ||
+      status === SubscriptionStatus.ACTIVE
+    )
+  ) {
+    return "Истекла";
+  }
+
+  return getSubscriptionStatusLabel(status);
 }
 
 function getBotUserDisplayName(user: {
@@ -3130,8 +3720,9 @@ function formatManagedBotUser(
     "💳 <b>Подписка</b>",
     `Тариф: ${escapeHtml(subscription?.planCode ?? "—")}`,
     `Статус: ${escapeHtml(
-      getSubscriptionStatusLabel(
-        subscription?.status ?? null
+      getEffectiveSubscriptionStatusLabel(
+        subscription?.status ?? null,
+        subscription?.expiresAt ?? null
       )
     )}`,
     `Начало: ${escapeHtml(
@@ -3230,9 +3821,10 @@ bot.command("users", async (ctx) => {
       `Подписка: ${escapeHtml(
         subscription?.planCode ?? "—"
       )} / ${escapeHtml(
-        getSubscriptionStatusLabel(
-          subscription?.status ?? null
-        )
+        getEffectiveSubscriptionStatusLabel(
+        subscription?.status ?? null,
+        subscription?.expiresAt ?? null
+      )
       )}`,
       `До: ${escapeHtml(
         formatAccessDate(
@@ -3289,32 +3881,58 @@ bot.command("user", async (ctx) => {
 bot.command("grant", async (ctx) => {
   if (!assertAdmin(ctx)) return;
 
-  const [, telegramId, rawDays] =
+  const parts =
     (ctx.message?.text ?? "")
       .trim()
       .split(/\s+/);
 
-  const days = parseSubscriptionDays(rawDays);
+  const telegramId = parts[1];
+  const rawPlanOrDays = parts[2];
+  const explicitPlan =
+    parsePaidPlanCode(rawPlanOrDays);
+
+  const planCode: PaidPlanCode =
+    explicitPlan ?? "START";
+
+  const rawDays =
+    explicitPlan
+      ? parts[3]
+      : rawPlanOrDays;
+
+  const days =
+    parseSubscriptionDays(rawDays);
 
   if (!telegramId || !days) {
     await ctx.reply(
       [
         "Формат:",
-        "/grant telegram_id количество_дней",
+        "/grant telegram_id тариф количество_дней",
         "",
-        "Пример:",
+        "Доступные тарифы:",
+        "START",
+        "PRO",
+        "",
+        "Примеры:",
+        "/grant 123456789 START 30",
+        "/grant 123456789 PRO 30",
+        "",
+        "Старый формат тоже поддерживается:",
         "/grant 123456789 30",
+        "В этом случае будет выдан тариф START.",
         "",
-        "Допустимо от 1 до 3650 дней."
+        "Допустимый срок: от 1 до 3650 дней."
       ].join("\n")
     );
     return;
   }
 
-  const user = await getManagedBotUser(telegramId);
+  const user =
+    await getManagedBotUser(telegramId);
 
   if (!user) {
-    await ctx.reply("Пользователь не найден.");
+    await ctx.reply(
+      "Пользователь не найден."
+    );
     return;
   }
 
@@ -3326,14 +3944,18 @@ bot.command("grant", async (ctx) => {
   }
 
   const now = new Date();
-  const expiresAt = addDaysToDate(now, days);
+  const expiresAt =
+    addDaysToDate(now, days);
+
+  const plan =
+    PLAN_DEFINITIONS[planCode];
 
   await prisma.subscription.upsert({
     where: {
       userId: user.id
     },
     update: {
-      planCode: "MANUAL",
+      planCode,
       status: SubscriptionStatus.ACTIVE,
       startsAt: now,
       expiresAt,
@@ -3341,7 +3963,7 @@ bot.command("grant", async (ctx) => {
     },
     create: {
       userId: user.id,
-      planCode: "MANUAL",
+      planCode,
       status: SubscriptionStatus.ACTIVE,
       startsAt: now,
       expiresAt,
@@ -3349,14 +3971,35 @@ bot.command("grant", async (ctx) => {
     }
   });
 
+  const enforcedLimits =
+    await enforceUserPlanLimits(
+      user.id,
+      plan
+    );
+
   await ctx.reply(
     [
       "✅ Подписка выдана.",
       "",
       `Пользователь: ${getBotUserDisplayName(user)}`,
       `Telegram ID: ${user.telegramId}`,
+      `Тариф: ${plan.label} (${plan.code})`,
       `Срок: ${days} дн.`,
-      `Доступ до: ${formatAccessDate(expiresAt)}`
+      `Доступ до: ${formatAccessDate(expiresAt)}`,
+      "",
+      `Лимит триггеров: ${formatPlanLimit(plan.maxTriggers)}`,
+      `Лимит источников: ${formatPlanLimit(plan.maxSources)}`,
+      ...(
+        enforcedLimits.disabledTriggerCount > 0 ||
+        enforcedLimits.disabledSourceCount > 0
+          ? [
+              "",
+              "⚠️ Превышение лимитов тарифа:",
+              `Отключено триггеров: ${enforcedLimits.disabledTriggerCount}`,
+              `Отключено источников: ${enforcedLimits.disabledSourceCount}`
+            ]
+          : []
+      )
     ].join("\n")
   );
 
@@ -3364,8 +4007,26 @@ bot.command("grant", async (ctx) => {
     user.deliveryChatId,
     [
       "✅ Ваша подписка активирована.",
+      "",
+      `Тариф: ${plan.label}`,
       `Срок: ${days} дн.`,
-      `Доступ до: ${formatAccessDate(expiresAt)}`
+      `Доступ до: ${formatAccessDate(expiresAt)}`,
+      "",
+      `Триггеры: до ${formatPlanLimit(plan.maxTriggers)}`,
+      `Источники: до ${formatPlanLimit(plan.maxSources)}`,
+      ...(
+        enforcedLimits.disabledTriggerCount > 0 ||
+        enforcedLimits.disabledSourceCount > 0
+          ? [
+              "",
+              "Часть ресурсов отключена из-за лимитов тарифа.",
+              `Отключено триггеров: ${enforcedLimits.disabledTriggerCount}`,
+              `Отключено источников: ${enforcedLimits.disabledSourceCount}`
+            ]
+          : []
+      ),
+      "",
+      "Проверить подписку: /subscription"
     ].join("\n")
   );
 });
@@ -3378,7 +4039,8 @@ bot.command("extend", async (ctx) => {
       .trim()
       .split(/\s+/);
 
-  const days = parseSubscriptionDays(rawDays);
+  const days =
+    parseSubscriptionDays(rawDays);
 
   if (!telegramId || !days) {
     await ctx.reply(
@@ -3387,16 +4049,21 @@ bot.command("extend", async (ctx) => {
         "/extend telegram_id количество_дней",
         "",
         "Пример:",
-        "/extend 123456789 7"
+        "/extend 123456789 7",
+        "",
+        "Текущий тариф пользователя будет сохранён."
       ].join("\n")
     );
     return;
   }
 
-  const user = await getManagedBotUser(telegramId);
+  const user =
+    await getManagedBotUser(telegramId);
 
   if (!user) {
-    await ctx.reply("Пользователь не найден.");
+    await ctx.reply(
+      "Пользователь не найден."
+    );
     return;
   }
 
@@ -3408,19 +4075,18 @@ bot.command("extend", async (ctx) => {
   }
 
   const now = new Date();
+
   const currentExpiresAt =
     user.subscription?.expiresAt;
 
-  const baseDate =
+  const extensionBase =
     currentExpiresAt &&
     currentExpiresAt.getTime() > now.getTime()
       ? currentExpiresAt
       : now;
 
-  const expiresAt = addDaysToDate(
-    baseDate,
-    days
-  );
+  const expiresAt =
+    addDaysToDate(extensionBase, days);
 
   await prisma.subscription.upsert({
     where: {
@@ -3433,7 +4099,7 @@ bot.command("extend", async (ctx) => {
     },
     create: {
       userId: user.id,
-      planCode: "MANUAL",
+      planCode: "START",
       status: SubscriptionStatus.ACTIVE,
       startsAt: now,
       expiresAt,
@@ -3441,13 +4107,37 @@ bot.command("extend", async (ctx) => {
     }
   });
 
+  const plan =
+    user.subscription
+      ? getPlanDefinition(user)
+      : PLAN_DEFINITIONS.START;
+
+  const enforcedLimits =
+    await enforceUserPlanLimits(
+      user.id,
+      plan
+    );
+
   await ctx.reply(
     [
       "✅ Подписка продлена.",
       "",
       `Пользователь: ${getBotUserDisplayName(user)}`,
+      `Telegram ID: ${user.telegramId}`,
+      `Тариф: ${plan.label} (${plan.code})`,
       `Добавлено: ${days} дн.`,
-      `Доступ до: ${formatAccessDate(expiresAt)}`
+      `Доступ до: ${formatAccessDate(expiresAt)}`,
+      ...(
+        enforcedLimits.disabledTriggerCount > 0 ||
+        enforcedLimits.disabledSourceCount > 0
+          ? [
+              "",
+              "⚠️ Приведение к лимитам:",
+              `Отключено триггеров: ${enforcedLimits.disabledTriggerCount}`,
+              `Отключено источников: ${enforcedLimits.disabledSourceCount}`
+            ]
+          : []
+      )
     ].join("\n")
   );
 
@@ -3455,8 +4145,12 @@ bot.command("extend", async (ctx) => {
     user.deliveryChatId,
     [
       "✅ Ваша подписка продлена.",
+      "",
+      `Тариф: ${plan.label}`,
       `Добавлено: ${days} дн.`,
-      `Доступ до: ${formatAccessDate(expiresAt)}`
+      `Доступ до: ${formatAccessDate(expiresAt)}`,
+      "",
+      "Проверить подписку: /subscription"
     ].join("\n")
   );
 });
@@ -4521,15 +5215,37 @@ bot.command("unblockchat", async (ctx) => {
   await ctx.reply(`✅ Источник разблокирован: ${chatId}`);
 });
 
-bot.callbackQuery("triggers:list", async (ctx) => {
-  const user = await getCurrentBotUser(ctx);
+async function getTriggerCallbackUser(
+  ctx: Context
+) {
+  const user =
+    await getCurrentBotUser(ctx);
 
   if (!user) {
     await ctx.answerCallbackQuery({
       text: "Сначала выполните /start"
     });
-    return;
+    return null;
   }
+
+  if (!hasSubscriptionAccess(user)) {
+    await ctx.answerCallbackQuery({
+      text: user.isActive
+        ? "Подписка неактивна"
+        : "Аккаунт отключён",
+      show_alert: true
+    });
+    return null;
+  }
+
+  return user;
+}
+
+bot.callbackQuery("triggers:list", async (ctx) => {
+  const user =
+    await getTriggerCallbackUser(ctx);
+
+  if (!user) return;
 
   await ctx.answerCallbackQuery({
     text: "Триггеры обновлены"
@@ -4539,14 +5255,10 @@ bot.callbackQuery("triggers:list", async (ctx) => {
 });
 
 bot.callbackQuery("triggers:add", async (ctx) => {
-  const user = await getCurrentBotUser(ctx);
+  const user =
+    await getTriggerCallbackUser(ctx);
 
-  if (!user) {
-    await ctx.answerCallbackQuery({
-      text: "Сначала выполните /start"
-    });
-    return;
-  }
+  if (!user) return;
 
   await ctx.answerCallbackQuery({
     text: "Отправьте команду с фразой"
@@ -4569,14 +5281,10 @@ bot.callbackQuery("triggers:add", async (ctx) => {
 });
 
 bot.callbackQuery(/^trigger:toggle:/, async (ctx) => {
-  const user = await getCurrentBotUser(ctx);
+  const user =
+    await getTriggerCallbackUser(ctx);
 
-  if (!user) {
-    await ctx.answerCallbackQuery({
-      text: "Сначала выполните /start"
-    });
-    return;
-  }
+  if (!user) return;
 
   const [, , triggerId] =
     (ctx.callbackQuery.data ?? "").split(":");
@@ -4604,6 +5312,33 @@ bot.callbackQuery(/^trigger:toggle:/, async (ctx) => {
       text: "Триггер не найден"
     });
     return;
+  }
+
+  if (!trigger.isActive) {
+    const plan =
+      getPlanDefinition(user);
+
+    if (plan.maxTriggers !== null) {
+      const activeTriggerCount =
+        await prisma.userTrigger.count({
+          where: {
+            userId: user.id,
+            isActive: true
+          }
+        });
+
+      if (
+        activeTriggerCount >=
+        plan.maxTriggers
+      ) {
+        await ctx.answerCallbackQuery({
+          text:
+            `Лимит тарифа: ${plan.maxTriggers} активных триггеров`,
+          show_alert: true
+        });
+        return;
+      }
+    }
   }
 
   const updatedTrigger =
@@ -4638,14 +5373,10 @@ bot.callbackQuery(/^trigger:toggle:/, async (ctx) => {
 });
 
 bot.callbackQuery(/^trigger:delete:/, async (ctx) => {
-  const user = await getCurrentBotUser(ctx);
+  const user =
+    await getTriggerCallbackUser(ctx);
 
-  if (!user) {
-    await ctx.answerCallbackQuery({
-      text: "Сначала выполните /start"
-    });
-    return;
-  }
+  if (!user) return;
 
   const [, , triggerId] =
     (ctx.callbackQuery.data ?? "").split(":");
@@ -5609,6 +6340,18 @@ async function setupBotCommands(): Promise<void> {
       description: "Открыть главное меню"
     },
     {
+      command: "profile",
+      description: "Профиль и использование"
+    },
+    {
+      command: "subscription",
+      description: "Состояние подписки"
+    },
+    {
+      command: "plans",
+      description: "Доступные тарифы"
+    },
+    {
       command: "triggers",
       description: "Мои персональные триггеры"
     },
@@ -5683,6 +6426,9 @@ async function setupBotCommands(): Promise<void> {
 
   const ownerCommands = [
     { command: "start", description: "Панель владельца" },
+    { command: "profile", description: "Профиль и использование" },
+    { command: "subscription", description: "Состояние подписки" },
+    { command: "plans", description: "Доступные тарифы" },
     { command: "triggers", description: "Персональные триггеры" },
     { command: "addtrigger", description: "Добавить триггер" },
     { command: "removetrigger", description: "Удалить триггер" },
@@ -5767,6 +6513,7 @@ process.once("SIGTERM", shutdown);
 console.log("Bot is starting...");
 
 await ensureOwnerAccount();
+await enforceAllUserPlanLimits();
 await setupBotCommands();
 await schedulePendingHotLeadRefreshes();
 
