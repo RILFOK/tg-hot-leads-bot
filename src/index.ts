@@ -3426,16 +3426,11 @@ async function replyWithSubscriptionProfile(
   const plan = getPlanDefinition(user);
   const hasAccess = hasSubscriptionAccess(user);
 
-  const expiredByDate = Boolean(
-    user.subscription?.expiresAt &&
-    user.subscription.expiresAt.getTime() <= Date.now()
-  );
-
-  const statusLabel = expiredByDate
-    ? "Истекла"
-    : getSubscriptionStatusLabel(
-        user.subscription?.status ?? null
-      );
+  const statusLabel =
+    getEffectiveSubscriptionStatusLabel(
+      user.subscription?.status ?? null,
+      user.subscription?.expiresAt ?? null
+    );
 
   const displayName = getBotUserDisplayName({
     username: user.username,
