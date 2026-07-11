@@ -1180,12 +1180,12 @@ function buildPaymentProviderKeyboard(
     )
     .row()
     .text(
-      "💳 ЮKassa",
+      "💳 ЮKassa — скоро",
       `payment:provider:YOOKASSA:${planCode}`
     )
     .row()
     .text(
-      "💳 Robokassa",
+      "💳 Robokassa — скоро",
       `payment:provider:ROBOKASSA:${planCode}`
     )
     .row()
@@ -3006,6 +3006,74 @@ async function refreshHotLeadMessage(leadId: string): Promise<void> {
     });
 }
 
+const paymentExpirySweepIntervalMs =
+  5 * 60 * 1000;
+
+let paymentExpirySweepTimer:
+  ReturnType<typeof setInterval> | null =
+    null;
+
+async function expireStalePayments(): Promise<number> {
+  const now =
+    new Date();
+
+  const result =
+    await prisma.payment.updateMany({
+      where: {
+        activatedAt: null,
+        expiresAt: {
+          lte: now
+        },
+        status: {
+          in: [
+            PaymentStatus.CREATED,
+            PaymentStatus.PENDING
+          ]
+        }
+      },
+      data: {
+        status:
+          PaymentStatus.EXPIRED,
+        failureReason:
+          "Истёк срок действия платёжного заказа"
+      }
+    });
+
+  if (result.count > 0) {
+    console.log(
+      "PAYMENT_ORDERS_EXPIRED",
+      {
+        count: result.count,
+        checkedAt:
+          now.toISOString()
+      }
+    );
+  }
+
+  return result.count;
+}
+
+function startPaymentExpirySweeper(): void {
+  if (paymentExpirySweepTimer) {
+    clearInterval(
+      paymentExpirySweepTimer
+    );
+  }
+
+  paymentExpirySweepTimer =
+    setInterval(() => {
+      void expireStalePayments()
+        .catch((error) => {
+          console.error(
+            "PAYMENT_EXPIRY_SWEEP_ERROR",
+            error
+          );
+        });
+    }, paymentExpirySweepIntervalMs);
+
+  paymentExpirySweepTimer.unref();
+}
+
 async function schedulePendingHotLeadRefreshes(): Promise<void> {
   const leads = await prisma.lead.findMany({
     where: {
@@ -3077,7 +3145,7 @@ bot.command("start", async (ctx) => {
     if (!hasAccess) {
       await ctx.reply(
         [
-          "👋 <b>Аккаунт активен</b>",
+          "👋 <b>Подписка неактивна</b>",
           "",
           `Тариф: ${escapeHtml(plan.label)}`,
           `Статус подписки: ${escapeHtml(statusLabel)}`,
@@ -3882,12 +3950,12 @@ async function replyWithPaymentMethods(
         formatRubPrice(
           offer.rubAmountMinor
         )
-      )}`,
+      )} — скоро`,
       `💳 Robokassa: ${escapeHtml(
         formatRubPrice(
           offer.rubAmountMinor
         )
-      )}`,
+      )} — скоро`,
       "",
       `Счёт действителен: ${paymentOrderTtlMinutes} мин.`,
       "Подписка будет активирована только после подтверждения платежа.",
@@ -4299,7 +4367,8 @@ async function activateSubscriptionFromPayment(
                 in: [
                   PaymentStatus.CREATED,
                   PaymentStatus.PENDING,
-                  PaymentStatus.SUCCEEDED
+                  PaymentStatus.SUCCEEDED,
+                  PaymentStatus.EXPIRED
                 ]
               }
             },
@@ -6263,6 +6332,18 @@ bot.callbackQuery(
       return;
     }
 
+    if (
+      selection.provider !==
+      PaymentProvider.TELEGRAM_STARS
+    ) {
+      await ctx.answerCallbackQuery({
+        text:
+          "Этот способ оплаты подключается. Сейчас доступна оплата Telegram Stars.",
+        show_alert: true
+      });
+      return;
+    }
+
     const offer =
       PAYMENT_OFFERS[
         selection.planCode
@@ -8121,6 +8202,15 @@ async function shutdown(): Promise<void> {
 
   scheduledHotRefreshes.clear();
 
+  if (paymentExpirySweepTimer) {
+    clearInterval(
+      paymentExpirySweepTimer
+    );
+
+    paymentExpirySweepTimer =
+      null;
+  }
+
   await prisma.$disconnect();
   process.exit(0);
 }
@@ -8132,6 +8222,8 @@ console.log("Bot is starting...");
 
 await ensureOwnerAccount();
 await enforceAllUserPlanLimits();
+await expireStalePayments();
+startPaymentExpirySweeper();
 await setupBotCommands();
 await schedulePendingHotLeadRefreshes();
 
