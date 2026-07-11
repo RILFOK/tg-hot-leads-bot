@@ -2,6 +2,7 @@ import "dotenv/config";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { Bot, InlineKeyboard } from "grammy";
 import type { Context } from "grammy";
+import { SocksProxyAgent } from "socks-proxy-agent";
 import {
   LeadCategory,
   LeadDeliveryType,
@@ -16,6 +17,8 @@ const token = process.env.BOT_TOKEN?.trim();
 const adminChatId = process.env.ADMIN_CHAT_ID?.trim();
 const ownerTelegramId = process.env.OWNER_TELEGRAM_ID?.trim();
 const databaseUrl = process.env.DATABASE_URL?.trim();
+const telegramProxyUrl =
+  process.env.TELEGRAM_PROXY_URL?.trim();
 
 const minLeadScore = Number(process.env.MIN_LEAD_SCORE ?? 3);
 const hotLeadMinutes = Number(process.env.HOT_LEAD_MINUTES ?? 30);
@@ -59,9 +62,42 @@ if (!Number.isInteger(trialDays) || trialDays <= 0) {
   throw new Error("TRIAL_DAYS должен быть положительным целым числом");
 }
 
-const adapter = new PrismaPg({ connectionString: databaseUrl });
-const prisma = new PrismaClient({ adapter });
-const bot = new Bot(token);
+const adapter = new PrismaPg({
+  connectionString: databaseUrl
+});
+
+const prisma = new PrismaClient({
+  adapter
+});
+
+const telegramProxyAgent =
+  telegramProxyUrl
+    ? new SocksProxyAgent(
+        telegramProxyUrl
+      )
+    : null;
+
+const bot = new Bot(
+  token,
+  telegramProxyAgent
+    ? {
+        client: {
+          baseFetchConfig: {
+            agent:
+              telegramProxyAgent,
+            compress: true
+          }
+        }
+      }
+    : undefined
+);
+
+console.log(
+  "TELEGRAM_PROXY",
+  telegramProxyAgent
+    ? "enabled"
+    : "disabled"
+);
 
 const seenMessages = new Map<string, number>();
 const scheduledHotRefreshes = new Map<string, NodeJS.Timeout>();
