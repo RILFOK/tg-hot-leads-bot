@@ -3243,6 +3243,7 @@ bot.command("start", async (ctx) => {
       "/user telegram_id — карточка пользователя",
       "/grant telegram_id START|PRO дни — выдать подписку",
       "/extend telegram_id дни — продлить подписку",
+      "/deductdays telegram_id дни — списать дни подписки",
       "/revoke telegram_id — отменить подписку",
       "/approvepayment telegram_id|payment_id — одобрить платёж",
       "/blockuser telegram_id — отключить аккаунт",
@@ -5102,6 +5103,190 @@ bot.command("extend", async (ctx) => {
       "",
       "Проверить подписку: /subscription"
     ].join("\n")
+  );
+});
+
+bot.command("deductdays", async (ctx) => {
+  if (!assertAdmin(ctx)) return;
+
+  const [, telegramId, rawDays] =
+    (ctx.message?.text ?? "")
+      .trim()
+      .split(/\s+/);
+
+  const days =
+    parseSubscriptionDays(rawDays);
+
+  if (!telegramId || !days) {
+    await ctx.reply(
+      [
+        "Формат:",
+        "/deductdays telegram_id количество_дней",
+        "",
+        "Пример:",
+        "/deductdays 8400621373 5",
+        "",
+        "Команда уменьшает текущий срок подписки."
+      ].join("\n")
+    );
+    return;
+  }
+
+  const user =
+    await getManagedBotUser(telegramId);
+
+  if (!user) {
+    await ctx.reply(
+      "Пользователь не найден."
+    );
+    return;
+  }
+
+  if (
+    user.role ===
+    UserRole.OWNER
+  ) {
+    await ctx.reply(
+      "Подписка владельца бессрочная и не изменяется."
+    );
+    return;
+  }
+
+  const subscription =
+    user.subscription;
+
+  const now =
+    new Date();
+
+  const hasActiveSubscription =
+    subscription?.expiresAt &&
+    (
+      subscription.status ===
+        SubscriptionStatus.TRIAL ||
+      subscription.status ===
+        SubscriptionStatus.ACTIVE
+    ) &&
+    subscription.expiresAt.getTime() >
+      now.getTime();
+
+  if (
+    !subscription ||
+    !subscription.expiresAt ||
+    !hasActiveSubscription
+  ) {
+    await ctx.reply(
+      [
+        "У пользователя нет активного срока для списания.",
+        "",
+        `Telegram ID: ${telegramId}`,
+        `Статус: ${
+          subscription?.status ?? "нет подписки"
+        }`,
+        `Доступ до: ${formatAccessDate(
+          subscription?.expiresAt ?? null
+        )}`
+      ].join("\n")
+    );
+    return;
+  }
+
+  const previousExpiresAt =
+    subscription.expiresAt;
+
+  const calculatedExpiresAt =
+    addDaysToDate(
+      previousExpiresAt,
+      -days
+    );
+
+  const expiredImmediately =
+    calculatedExpiresAt.getTime() <=
+    now.getTime();
+
+  const expiresAt =
+    expiredImmediately
+      ? now
+      : calculatedExpiresAt;
+
+  const nextStatus =
+    expiredImmediately
+      ? SubscriptionStatus.EXPIRED
+      : subscription.status;
+
+  await prisma.subscription.update({
+    where: {
+      userId: user.id
+    },
+    data: {
+      status: nextStatus,
+      expiresAt,
+      autoRenew: false
+    }
+  });
+
+  const plan =
+    getPlanDefinition(user);
+
+  await ctx.reply(
+    [
+      expiredImmediately
+        ? "⛔ Подписка завершена досрочно."
+        : "➖ Дни подписки списаны.",
+      "",
+      `Пользователь: ${getBotUserDisplayName(
+        user
+      )}`,
+      `Telegram ID: ${user.telegramId}`,
+      `Тариф: ${plan.label} (${plan.code})`,
+      `Списано: ${days} дн.`,
+      `Было доступно до: ${formatAccessDate(
+        previousExpiresAt
+      )}`,
+      `Теперь доступно до: ${formatAccessDate(
+        expiresAt
+      )}`,
+      `Статус: ${nextStatus}`
+    ].join("\n")
+  );
+
+  await notifyBotUser(
+    user.deliveryChatId,
+    [
+      expiredImmediately
+        ? "⛔ Срок вашей подписки завершён администратором."
+        : "➖ Срок вашей подписки уменьшен администратором.",
+      "",
+      `Тариф: ${plan.label}`,
+      `Списано: ${days} дн.`,
+      `Новый срок: ${formatAccessDate(
+        expiresAt
+      )}`,
+      "",
+      expiredImmediately
+        ? "Доступ к функциям бота приостановлен."
+        : "Проверить подписку: /subscription"
+    ].join("\n")
+  );
+
+  console.log(
+    "SUBSCRIPTION_DAYS_DEDUCTED",
+    {
+      telegramId:
+        user.telegramId,
+      userId:
+        user.id,
+      planCode:
+        plan.code,
+      deductedDays:
+        days,
+      previousExpiresAt:
+        previousExpiresAt.toISOString(),
+      expiresAt:
+        expiresAt.toISOString(),
+      expiredImmediately,
+      changedBy:
+        ownerTelegramUserId
+    }
   );
 });
 
@@ -8478,6 +8663,7 @@ async function setupBotCommands(): Promise<void> {
     { command: "user", description: "Карточка пользователя" },
     { command: "grant", description: "Выдать подписку" },
     { command: "extend", description: "Продлить подписку" },
+    { command: "deductdays", description: "Списать дни подписки" },
     { command: "revoke", description: "Отменить подписку" },
     { command: "approvepayment", description: "Одобрить платёж вручную" },
     { command: "blockuser", description: "Отключить аккаунт" },
