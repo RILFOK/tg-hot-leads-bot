@@ -3244,6 +3244,7 @@ bot.command("start", async (ctx) => {
       "/grant telegram_id START|PRO дни — выдать подписку",
       "/extend telegram_id дни — продлить подписку",
       "/revoke telegram_id — отменить подписку",
+      "/approvepayment telegram_id|payment_id — одобрить платёж",
       "/blockuser telegram_id — отключить аккаунт",
       "/unblockuser telegram_id — включить аккаунт",
       "/id — показать chat_id",
@@ -4278,9 +4279,15 @@ type PaymentActivationResult = {
   alreadyActivated: boolean;
 };
 
+type PaymentActivationSource =
+  | "PROVIDER"
+  | "ADMIN";
+
 async function activateSubscriptionFromPayment(
   paymentId: string,
-  providerPaymentId: string
+  providerPaymentId: string | null,
+  activationSource:
+    PaymentActivationSource = "PROVIDER"
 ): Promise<PaymentActivationResult> {
   const result =
     await prisma.$transaction(
@@ -4375,7 +4382,9 @@ async function activateSubscriptionFromPayment(
             data: {
               status:
                 PaymentStatus.SUCCEEDED,
-              providerPaymentId,
+              providerPaymentId:
+                providerPaymentId ??
+                payment.providerPaymentId,
               paidAt:
                 payment.paidAt ?? now,
               activatedAt: now,
@@ -4495,17 +4504,32 @@ async function activateSubscriptionFromPayment(
       plan
     );
 
+    const activationTitle =
+      activationSource === "ADMIN"
+        ? "✅ Подписка активирована администратором."
+        : "✅ Оплата подтверждена.";
+
+    const activationDetails =
+      activationSource === "ADMIN"
+        ? [
+            "Подписка активирована вручную.",
+            "Реальное списание не выполнялось."
+          ]
+        : [
+            "Подписка активирована."
+          ];
+
     await notifyBotUser(
       result.deliveryChatId,
       [
-        "✅ Оплата подтверждена.",
+        activationTitle,
         "",
         `Тариф: ${plan.label}`,
         `Доступ до: ${formatAccessDate(
           result.expiresAt
         )}`,
         "",
-        "Подписка активирована.",
+        ...activationDetails,
         "Проверить: /subscription"
       ].join("\n")
     );
@@ -5137,6 +5161,322 @@ bot.command("revoke", async (ctx) => {
     "⛔ Ваша подписка отключена администратором."
   );
 });
+
+bot.command(
+  "approvepayment",
+  async (ctx) => {
+    if (!assertAdmin(ctx)) return;
+
+    const target =
+      ctx.message?.text
+        .trim()
+        .split(/\s+/)[1];
+
+    if (!target) {
+      await ctx.reply(
+        [
+          "Формат:",
+          "<code>/approvepayment telegram_id</code>",
+          "или",
+          "<code>/approvepayment payment_id</code>",
+          "",
+          "Пример:",
+          "<code>/approvepayment 8400621373</code>"
+        ].join("\n"),
+        {
+          parse_mode: "HTML"
+        }
+      );
+      return;
+    }
+
+    const approvableStatuses: PaymentStatus[] = [
+      PaymentStatus.CREATED,
+      PaymentStatus.PENDING,
+      PaymentStatus.EXPIRED
+    ];
+
+    const payment =
+      /^\d+$/.test(target)
+        ? await prisma.payment.findFirst({
+            where: {
+              activatedAt: null,
+              status: {
+                in: approvableStatuses
+              },
+              user: {
+                telegramId: target
+              }
+            },
+            orderBy: {
+              createdAt: "desc"
+            },
+            include: {
+              user: {
+                select: {
+                  id: true,
+                  telegramId: true,
+                  username: true,
+                  firstName: true,
+                  lastName: true,
+                  deliveryChatId: true,
+                  isActive: true,
+                  role: true
+                }
+              }
+            }
+          })
+        : await prisma.payment.findUnique({
+            where: {
+              id: target
+            },
+            include: {
+              user: {
+                select: {
+                  id: true,
+                  telegramId: true,
+                  username: true,
+                  firstName: true,
+                  lastName: true,
+                  deliveryChatId: true,
+                  isActive: true,
+                  role: true
+                }
+              }
+            }
+          });
+
+    if (!payment) {
+      await ctx.reply(
+        [
+          "Платёж для одобрения не найден.",
+          "",
+          "Пользователь должен сначала создать заказ через /plans."
+        ].join("\n")
+      );
+      return;
+    }
+
+    if (payment.activatedAt) {
+      await ctx.reply(
+        [
+          "Этот платёж уже активирован.",
+          `Payment ID: ${payment.id}`,
+          `Дата: ${formatAccessDate(
+            payment.activatedAt
+          )}`
+        ].join("\n")
+      );
+      return;
+    }
+
+    if (
+      !approvableStatuses.includes(
+        payment.status
+      )
+    ) {
+      await ctx.reply(
+        [
+          "Платёж нельзя одобрить в текущем статусе.",
+          `Payment ID: ${payment.id}`,
+          `Статус: ${payment.status}`
+        ].join("\n")
+      );
+      return;
+    }
+
+    if (
+      payment.user.role ===
+      UserRole.OWNER
+    ) {
+      await ctx.reply(
+        "Владельцу не требуется платная подписка."
+      );
+      return;
+    }
+
+    if (!payment.user.isActive) {
+      await ctx.reply(
+        [
+          "Аккаунт пользователя отключён.",
+          "Сначала используйте:",
+          `<code>/unblockuser ${escapeHtml(
+            payment.user.telegramId
+          )}</code>`
+        ].join("\n"),
+        {
+          parse_mode: "HTML"
+        }
+      );
+      return;
+    }
+
+    const externalEventKey =
+      `admin_approved:${payment.id}`;
+
+    let paymentEventId:
+      string | null = null;
+
+    try {
+      const event =
+        await prisma.paymentEvent.upsert({
+          where: {
+            provider_externalEventKey: {
+              provider:
+                payment.provider,
+              externalEventKey
+            }
+          },
+          update: {
+            paymentId:
+              payment.id,
+            processingError: null
+          },
+          create: {
+            paymentId:
+              payment.id,
+            provider:
+              payment.provider,
+            externalEventKey,
+            eventType:
+              "admin_approved",
+            payload: {
+              paymentId:
+                payment.id,
+              approvedByTelegramId:
+                ownerTelegramUserId,
+              target,
+              previousStatus:
+                payment.status,
+              manualApproval: true,
+              approvedAt:
+                new Date().toISOString()
+            }
+          }
+        });
+
+      paymentEventId =
+        event.id;
+
+      const activation =
+        await activateSubscriptionFromPayment(
+          payment.id,
+          null,
+          "ADMIN"
+        );
+
+      await prisma.paymentEvent.update({
+        where: {
+          id: event.id
+        },
+        data: {
+          processedAt:
+            new Date(),
+          processingError: null
+        }
+      });
+
+      const plan =
+        PLAN_DEFINITIONS[
+          activation.planCode
+        ];
+
+      const displayName =
+        getBotUserDisplayName({
+          username:
+            payment.user.username,
+          firstName:
+            payment.user.firstName,
+          lastName:
+            payment.user.lastName,
+          telegramId:
+            payment.user.telegramId
+        });
+
+      await ctx.reply(
+        [
+          "✅ <b>Платёж одобрен вручную</b>",
+          "",
+          `Пользователь: ${escapeHtml(
+            displayName
+          )}`,
+          `Telegram ID: <code>${escapeHtml(
+            payment.user.telegramId
+          )}</code>`,
+          `Тариф: ${escapeHtml(
+            plan.label
+          )}`,
+          `Доступ до: ${escapeHtml(
+            formatAccessDate(
+              activation.expiresAt
+            )
+          )}`,
+          `Payment ID: <code>${escapeHtml(
+            payment.id
+          )}</code>`,
+          "",
+          activation.alreadyActivated
+            ? "Повторная активация не выполнялась."
+            : "Подписка активирована без реального списания."
+        ].join("\n"),
+        {
+          parse_mode: "HTML"
+        }
+      );
+
+      console.log(
+        "PAYMENT_ADMIN_APPROVED",
+        {
+          paymentId:
+            payment.id,
+          telegramId:
+            payment.user.telegramId,
+          planCode:
+            activation.planCode,
+          approvedBy:
+            ownerTelegramUserId,
+          alreadyActivated:
+            activation.alreadyActivated
+        }
+      );
+    } catch (error) {
+      console.error(
+        "PAYMENT_ADMIN_APPROVAL_ERROR",
+        {
+          paymentId:
+            payment.id,
+          telegramId:
+            payment.user.telegramId,
+          approvedBy:
+            ownerTelegramUserId,
+          error
+        }
+      );
+
+      if (paymentEventId) {
+        await prisma.paymentEvent.update({
+          where: {
+            id: paymentEventId
+          },
+          data: {
+            processingError:
+              error instanceof Error
+                ? error.message
+                : String(error)
+          }
+        }).catch(() => undefined);
+      }
+
+      await ctx.reply(
+        [
+          "Не удалось одобрить платёж.",
+          `Payment ID: ${payment.id}`,
+          "Проверьте журнал PM2."
+        ].join("\n")
+      );
+    }
+  }
+);
 
 bot.command("blockuser", async (ctx) => {
   if (!assertAdmin(ctx)) return;
@@ -8139,6 +8479,7 @@ async function setupBotCommands(): Promise<void> {
     { command: "grant", description: "Выдать подписку" },
     { command: "extend", description: "Продлить подписку" },
     { command: "revoke", description: "Отменить подписку" },
+    { command: "approvepayment", description: "Одобрить платёж вручную" },
     { command: "blockuser", description: "Отключить аккаунт" },
     { command: "unblockuser", description: "Включить аккаунт" },
     { command: "stats", description: "Статистика лидов" },
